@@ -50,10 +50,13 @@
 #define I2S_BCLK                        27          // BCLK (I2S)
 #define I2S_LRC                         26          // LRC (I2S)
 
+// Potentiometer 
+#define POTENTIOMETER                   34
+
 // Rotary encoder
-#define DREHENCODER_CLK                 34          // If you want to reverse encoder's direction, just switch GPIOs of CLK with DT (in software or hardware)
-#define DREHENCODER_DT                  35          // Info: Lolin D32 / Lolin D32 pro 35 are using 35 for battery-voltage-monitoring!
-#define DREHENCODER_BUTTON              32          // Button is used to switch Tonuino on and off
+//#define DREHENCODER_CLK                 34          // If you want to reverse encoder's direction, just switch GPIOs of CLK with DT (in software or hardware)
+//#define DREHENCODER_DT                  35          // Info: Lolin D32 / Lolin D32 pro 35 are using 35 for battery-voltage-monitoring!
+//#define DREHENCODER_BUTTON              32          // Button is used to switch Tonuino on and off
 
 // Control-buttons
 #define PAUSEPLAY_BUTTON                5           // GPIO to detect pause/play

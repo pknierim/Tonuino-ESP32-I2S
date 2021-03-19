@@ -19,8 +19,11 @@
     #define SPISD_SCK                   14          // GPIO for clock-signal (SD) => not necessary for single-SPI
 #endif
 
-#define MFRC522_RST_PIN                 12          // needed for i2c-comm  MTDI on JTAG
-#define MFRC522_ADDR                    0x28        // default Address of MFRC522
+//#define MFRC522_RST_PIN                 12          // needed for i2c-comm  MTDI on JTAG
+//#define MFRC522_ADDR                    0x28        // default Address of MFRC522
+#define RFID_CS                         0x28          // TODO: check no / Pin
+#define RST_PIN                         12          // TODO: check no / Pin
+
 #define ext_IIC_CLK                     23          // 14-pin-header
 #define ext_IIC_DATA                    18          // 14-pin-header
 

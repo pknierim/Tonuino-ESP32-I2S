@@ -186,7 +186,12 @@ uint8_t const cardIdSize = 4;                           // RFID
 uint8_t maxVolume = 21;                                 // Current maximum volume that can be adjusted
 uint8_t maxVolumeSpeaker = 21;                          // Maximum volume that can be adjusted in speaker-mode (default; can be changed later via GUI)
 uint8_t minVolume = 0;                                  // Lowest volume that can be adjusted
-uint8_t initVolume = 3;                                 // 0...21 (If not found in NVS, this one will be taken) (default; can be changed later via GUI)
+uint8_t initVolume = 1;                                 // 0...21 (If not found in NVS, this one will be taken) (default; can be changed later via GUI)
+int32_t potVolume = 0;
+const int RunningAverageCount = 32;
+float RunningAverageBuffer[RunningAverageCount];
+int NextRunningAverage;
+
 #ifdef HEADPHONE_ADJUST_ENABLE
     uint8_t maxVolumeHeadphone = 11;                    // Maximum volume that can be adjusted in headphone-mode (default; can be changed later via GUI)
 #endif
@@ -684,7 +689,7 @@ void buttonHandler() {
         buttons[0].currentState = digitalRead(NEXT_BUTTON);
         buttons[1].currentState = digitalRead(PREVIOUS_BUTTON);
         buttons[2].currentState = digitalRead(PAUSEPLAY_BUTTON);
-        buttons[3].currentState = digitalRead(DREHENCODER_BUTTON);
+        //buttons[3].currentState = digitalRead(DREHENCODER_BUTTON);
 
         // Iterate over all buttons in struct-array
         for (uint8_t i=0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
@@ -1433,7 +1438,7 @@ void playAudio(void *parameter) {
 
     uint8_t currentVolume;
     static BaseType_t trackQStatus;
-    static uint8_t trackCommand = 0;
+    static uint8_t trackCommand = 0;    
     bool audioReturnCode;
 
     for (;;) {
@@ -1821,8 +1826,12 @@ void rfidScanner(void *parameter) {
             lastRfidCheckTimestamp = millis();
             // Reset the loop if no new card is present on the sensor/reader. This saves the entire process when idle.
 
+
             if (!mfrc522.PICC_IsNewCardPresent()) {
                 continue;
+            }
+            else{
+                logger(serialDebug, "!!!NEUE KARTE!!!\n", LOGLEVEL_ERROR);
             }
 
             // Select one of the cards
@@ -1830,7 +1839,9 @@ void rfidScanner(void *parameter) {
                 continue;
             }
 
+            
             //mfrc522.PICC_DumpToSerial(&(mfrc522.uid));
+            
             mfrc522.PICC_HaltA();
             mfrc522.PCD_StopCrypto1();
 
@@ -2479,12 +2490,53 @@ void trackControlToQueueSender(const uint8_t trackCommand) {
 
 // Handles volume directed by rotary encoder
 void volumeHandler(const int32_t _minVolume, const int32_t _maxVolume) {
+    
+
+  float RawTemperature = analogRead(A6);
+
+  RunningAverageBuffer[NextRunningAverage++] = RawTemperature;
+  if (NextRunningAverage >= RunningAverageCount)
+  {
+    NextRunningAverage = 0; 
+  }
+  float RunningAverageTemperature = 0;
+  for(int i=0; i< RunningAverageCount; ++i)
+  {
+    RunningAverageTemperature += RunningAverageBuffer[i];
+  }
+  RunningAverageTemperature /= RunningAverageCount;
+
+
+
+
+    potVolume = (RunningAverageTemperature - 300)/161.9f ; 
+    if (potVolume<0)
+        potVolume = 0;
+    if (potVolume>21)   
+        potVolume = 21;
+
+    //potVolume = potVolume / 4.7619f;
+
+    //snprintf(logBuf, serialLoglength, "volumeHandler: %d", potVolume);
+    //loggerNl(serialDebug, logBuf, LOGLEVEL_NOTICE);
+
+
+    
+    currentVolume = potVolume;
+    if (currentVolume != lastVolume) {  
+        snprintf(logBuf, serialLoglength, "pot: %d, last: %d, current: %d", potVolume, lastVolume, currentVolume);
+        loggerNl(serialDebug, logBuf, LOGLEVEL_NOTICE);
+        lastVolume = currentVolume;
+        volumeToQueueSender(currentVolume);
+    }
+
+    /**
     if (lockControls) {
         encoder.clearCount();
         encoder.setCount(currentVolume*2);
         return;
     }
-
+    
     currentEncoderValue = encoder.getCount();
     // Only if initial run or value has changed. And only after "full step" of rotary encoder
     if (((lastEncoderValue != currentEncoderValue) || lastVolume == -1) && (currentEncoderValue % 2 == 0)) {
@@ -2506,7 +2558,8 @@ void volumeHandler(const int32_t _minVolume, const int32_t _maxVolume) {
             lastVolume = currentVolume;
             volumeToQueueSender(currentVolume);
         }
-    }
+    } 
+    **/
 }
 
 
@@ -4158,7 +4211,7 @@ void printWakeUpReason() {
 
 void setup() {
     Serial.begin(115200);
-    esp_sleep_enable_ext0_wakeup((gpio_num_t) DREHENCODER_BUTTON, 0);
+    // esp_sleep_enable_ext0_wakeup((gpio_num_t) DREHENCODER_BUTTON, 0);
     #ifdef PN5180_ENABLE_LPCD
         // disable pin hold from deep sleep (LPCD)
         gpio_deep_sleep_hold_dis();
@@ -4277,13 +4330,15 @@ void setup() {
 
     #ifdef RFID_READER_TYPE_MFRC522_SPI
         mfrc522.PCD_Init();
+        mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
         delay(50);
         loggerNl(serialDebug, (char *) FPSTR(rfidScannerReady), LOGLEVEL_DEBUG);
+        mfrc522.PCD_DumpVersionToSerial();	// Show details of PCD - MFRC522 Card Reader details
     #endif
 
    // welcome message
    Serial.println(F(""));
-   Serial.println(F("_____         _____ _____ _____ _____     "));
+   Serial.println(F(" _____         _____ _____ _____ _____     "));
    Serial.println(F("|_   _|___ ___|  |  |     |   | |     |   "));
    Serial.println(F("  | | | . |   |  |  |-   -| | | |  |  |   "));
    Serial.println(F("  |_| |___|_|_|_____|_____|_|___|_____|   "));
@@ -4582,16 +4637,21 @@ void setup() {
     );
 
 
+
+
     // Activate internal pullups for all buttons
-    pinMode(DREHENCODER_BUTTON, INPUT_PULLUP);
+    // pinMode(DREHENCODER_BUTTON, INPUT_PULLUP);
     pinMode(PAUSEPLAY_BUTTON, INPUT_PULLUP);
     pinMode(NEXT_BUTTON, INPUT_PULLUP);
     pinMode(PREVIOUS_BUTTON, INPUT_PULLUP);
 
     // Init rotary encoder
-    encoder.attachHalfQuad(DREHENCODER_CLK, DREHENCODER_DT);
-    encoder.clearCount();
-    encoder.setCount(initVolume*2);         // Ganzes Raster ist immer +2, daher initiale Lautstärke mit 2 multiplizieren
+    // encoder.attachHalfQuad(DREHENCODER_CLK, DREHENCODER_DT);
+    // encoder.clearCount();
+    // encoder.setCount(initVolume*2);         // Ganzes Raster ist immer +2, daher initiale Lautstärke mit 2 multiplizieren
+
+    // Init potentiomenter
+
 
     // Only enable MQTT if requested
     #ifdef MQTT_ENABLE
