@@ -11,9 +11,15 @@
     #include "settings-lolin_d32.h"                     // Contains all user-relevant settings for Wemos Lolin D32
 #elif (HAL == 4)
     #include "settings-lolin_d32_pro.h"                 // Contains all user-relevant settings for Wemos Lolin D32 pro
+#elif (HAL == 5)
+    #include "settings-ttgo_t8.h"                       // Contains all user-relevant settings for Lilygo TTGO T8 1.7
+#elif (HAL == 99)
+    #include "settings-custom.h"                        // Contains all user-relevant settings custom-board
 #endif
 
-#include <ESP32Encoder.h>
+#ifdef USEROTARY_ENABLE
+    #include <ESP32Encoder.h>
+#endif
 #include "Arduino.h"
 #include <WiFi.h>
 #ifdef MDNS_ENABLE
@@ -23,7 +29,11 @@
     #include "ESP32FtpServer.h"
 #endif
 #ifdef BLUETOOTH_ENABLE
+    #include "esp_bt.h"
     #include "BluetoothA2DPSink.h"
+#endif
+#ifdef IR_CONTROL_ENABLE
+    #include <IRremote.h>
 #endif
 #include "Audio.h"
 #include "SPI.h"
@@ -71,13 +81,15 @@
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <nvsDump.h>
-
 #include "freertos/ringbuf.h"
-
+#include "values.h"
 
 // Serial-logging buffer
 uint8_t serialLoglength = 200;
-char *logBuf = (char*) calloc(serialLoglength, sizeof(char)); // Buffer for all log-messages
+char *logBuf;   // Defintion in setup()
+
+// FilePathLength
+#define MAX_FILEPATH_LENTGH 256
 
 #ifdef HEADPHONE_ADJUST_ENABLE
     bool headphoneLastDetectionState;
@@ -85,7 +97,7 @@ char *logBuf = (char*) calloc(serialLoglength, sizeof(char)); // Buffer for all 
 #endif
 
 #ifdef BLUETOOTH_ENABLE
-    BluetoothA2DPSink a2dp_sink;
+    BluetoothA2DPSink *a2dp_sink;
 #endif
 
 #ifdef MEASURE_BATTERY_VOLTAGE
@@ -99,48 +111,6 @@ char *logBuf = (char*) calloc(serialLoglength, sizeof(char)); // Buffer for all 
 #ifdef PLAY_LAST_RFID_AFTER_REBOOT
     bool recoverLastRfid = true;
 #endif
-
-// Track-Control
-#define STOP                            1           // Stop play
-#define PLAY                            2           // Start play (currently not used)
-#define PAUSEPLAY                       3           // Pause/play
-#define NEXTTRACK                       4           // Next track of playlist
-#define PREVIOUSTRACK                   5           // Previous track of playlist
-#define FIRSTTRACK                      6           // First track of playlist
-#define LASTTRACK                       7           // Last track of playlist
-
-// Playmodes
-#define NO_PLAYLIST                     0           // If no playlist is active
-#define SINGLE_TRACK                    1           // Play a single track
-#define SINGLE_TRACK_LOOP               2           // Play a single track in infinite-loop
-#define AUDIOBOOK                       3           // Single track, can save last play-position
-#define AUDIOBOOK_LOOP                  4           // Single track as infinite-loop, can save last play-position
-#define ALL_TRACKS_OF_DIR_SORTED        5           // Play all files of a directory (alph. sorted)
-#define ALL_TRACKS_OF_DIR_RANDOM        6           // Play all files of a directory (randomized)
-#define ALL_TRACKS_OF_DIR_SORTED_LOOP   7           // Play all files of a directory (alph. sorted) in infinite-loop
-#define ALL_TRACKS_OF_DIR_RANDOM_LOOP   9           // Play all files of a directory (randomized) in infinite-loop
-#define WEBSTREAM                       8           // Play webradio-stream
-#define BUSY                            10          // Used if playlist is created
-
-// RFID-modifcation-types
-#define LOCK_BUTTONS_MOD                100         // Locks all buttons and rotary encoder
-#define SLEEP_TIMER_MOD_15              101         // Puts uC into deepsleep after 15 minutes + LED-DIMM
-#define SLEEP_TIMER_MOD_30              102         // Puts uC into deepsleep after 30 minutes + LED-DIMM
-#define SLEEP_TIMER_MOD_60              103         // Puts uC into deepsleep after 60 minutes + LED-DIMM
-#define SLEEP_TIMER_MOD_120             104         // Puts uC into deepsleep after 120 minutes + LED-DIMM
-#define SLEEP_AFTER_END_OF_TRACK        105         // Puts uC into deepsleep after track is finished + LED-DIMM
-#define SLEEP_AFTER_END_OF_PLAYLIST     106         // Puts uC into deepsleep after playlist is finished + LED-DIMM
-#define SLEEP_AFTER_5_TRACKS            107         // Puts uC into deepsleep after five tracks
-#define REPEAT_PLAYLIST                 110         // Changes active playmode to endless-loop (for a playlist)
-#define REPEAT_TRACK                    111         // Changes active playmode to endless-loop (for a single track)
-#define DIMM_LEDS_NIGHTMODE             120         // Changes LED-brightness
-#define TOGGLE_WIFI_STATUS              130         // Toggles WiFi-status
-
-// Repeat-Modes
-#define NO_REPEAT                       0           // No repeat
-#define TRACK                           1           // Repeat current track (infinite loop)
-#define PLAYLIST                        2           // Repeat whole playlist (infinite loop)
-#define TRACK_N_PLAYLIST                3           // Repeat both (infinite loop)
 
 typedef struct { // Bit field
     uint8_t playMode:                   4;      // playMode
@@ -159,6 +129,8 @@ typedef struct { // Bit field
     bool trackFinished:                 1;      // If current track is finished
     bool playlistFinished:              1;      // If whole playlist is finished
     uint8_t playUntilTrackNumber:       6;      // Number of tracks to play after which uC goes to sleep
+    uint8_t currentSeekmode:            2;      // If seekmode is active and if yes: forward or backwards?
+    uint8_t lastSeekmode:               2;      // Helper to determine if seekmode was changed
 } playProps;
 playProps playProperties;
 
@@ -166,6 +138,9 @@ typedef struct {
     char nvsKey[13];
     char nvsEntry[275];
 } nvs_t;
+
+// Operation Mode
+volatile uint8_t operationMode;
 
 // Configuration of initial values (for the first start) goes here....
 // There's no need to change them here as they can be configured via webinterface
@@ -259,7 +234,7 @@ uint8_t mqttPasswordLength = 16;
 char *mqtt_server = strndup((char*) "192.168.2.43", mqttServerLength);      // IP-address of MQTT-server (if not found in NVS this one will be taken)
 char *mqttUser = strndup((char*) "mqtt-user", mqttUserLength);              // MQTT-user
 char *mqttPassword = strndup((char*) "mqtt-password", mqttPasswordLength);  // MQTT-password*/
-
+uint16_t mqttPort = 1883;                                                       // MQTT-Port
 
 char stringDelimiter[] = "#";                               // Character used to encapsulate data in linear NVS-strings (don't change)
 char stringOuterDelimiter[] = "^";                          // Character used to encapsulate encapsulated data along with RFID-ID in backup-file
@@ -319,22 +294,30 @@ IPAddress myIP;
 #endif
 
 // Rotary encoder-configuration
-ESP32Encoder encoder;
+#ifdef USEROTARY_ENABLE
+    ESP32Encoder encoder;
+#endif
 
 // HW-Timer
-hw_timer_t *timer = NULL;
+#ifndef IR_CONTROL_ENABLE
+    hw_timer_t *timer = NULL;
+#else
+    uint32_t lastRcCmdTimestamp = 0;
+#endif
 volatile SemaphoreHandle_t timerSemaphore;
 
 // Button-helper
 typedef struct {
-    bool lastState;
-    bool currentState;
-    bool isPressed;
-    bool isReleased;
+    bool lastState : 1;
+    bool currentState : 1;
+    bool isPressed : 1;
+    bool isReleased : 1;
     unsigned long lastPressedTimestamp;
     unsigned long lastReleasedTimestamp;
 } t_button;
-t_button buttons[4];
+
+t_button buttons[7];    // next + prev + pplay + rotEnc + button4 + button5 + dummy-button
+uint8_t shutdownButton = 99;    // Helper used for Neopixel: stores button-number of shutdown-button
 
 Preferences prefsRfid;
 Preferences prefsSettings;
@@ -349,17 +332,35 @@ QueueHandle_t rfidCardQueue;
 RingbufHandle_t explorerFileUploadRingBuffer;
 QueueHandle_t explorerFileUploadStatusQueue;
 
+// Only enable those buttons that use GPIOs <= 39
+#if (NEXT_BUTTON >= 0 && NEXT_BUTTON <= 39)
+    #define BUTTON_0_ENABLE
+#endif
+#if (PREVIOUS_BUTTON >= 0 && PREVIOUS_BUTTON <= 39)
+    #define BUTTON_1_ENABLE
+#endif
+#if (PAUSEPLAY_BUTTON >= 0 && PAUSEPLAY_BUTTON <= 39)
+    #define BUTTON_2_ENABLE
+#endif
+#ifdef USEROTARY_ENABLE
+    #define BUTTON_3_ENABLE
+#endif
+#if (BUTTON_4 >= 0 && BUTTON_4 <= 39)
+    #define BUTTON_4_ENABLE
+#endif
+#if (BUTTON_5 >= 0 && BUTTON_5 <= 39)
+    #define BUTTON_5_ENABLE
+#endif
+
 // Prototypes
 void accessPointStart(const char *SSID, IPAddress ip, IPAddress netmask);
 static int arrSortHelper(const void* a, const void* b);
-#ifdef MQTT_ENABLE
-    void callback(const char *topic, const byte *payload, uint32_t length);
-#endif
 void batteryVoltageTester(void);
 void buttonHandler();
 void deepSleepManager(void);
 void doButtonActions(void);
 void doRfidCardModifications(const uint32_t mod);
+void doCmdAction(const uint16_t mod);
 bool dumpNvsToSd(char *_namespace, char *_destFile);
 bool endsWith (const char *str, const char *suf);
 bool fileValid(const char *_fileItem);
@@ -367,6 +368,7 @@ void freeMultiCharArray(char **arr, const uint32_t cnt);
 uint8_t getRepeatMode(void);
 bool getWifiEnableStatusFromNVS(void);
 void handleUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
+void convertAsciiToUtf8(String asciiString, char *utf8String);
 void convertUtf8ToAscii(String utf8String, char *asciiString);
 void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final);
 void explorerHandleFileStorageTask(void *parameter);
@@ -381,18 +383,15 @@ void loggerNl(const uint8_t _currentLogLevel, const char *str, const uint8_t _lo
 void logger(const uint8_t _currentLogLevel, const char *str, const uint8_t _logLevel);
 float measureBatteryVoltage(void);
 #ifdef MQTT_ENABLE
+    void callback(const char *topic, const byte *payload, uint32_t length);
     bool publishMqtt(const char *topic, const char *payload, bool retained);
+    void postHeartbeatViaMqtt(void);
+    bool reconnect();
 #endif
 size_t nvsRfidWriteWrapper (const char *_rfidCardId, const char *_track, const uint32_t _playPosition, const uint8_t _playMode, const uint16_t _trackLastPlayed, const uint16_t _numberOfTracks);
 void onWebsocketEvent(AsyncWebSocket * server, AsyncWebSocketClient * client, AwsEventType type, void * arg, uint8_t *data, size_t len);
-#ifdef MQTT_ENABLE
-    void postHeartbeatViaMqtt(void);
-#endif
 bool processJsonRequest(char *_serialJson);
 void randomizePlaylist (char *str[], const uint32_t count);
-#ifdef MQTT_ENABLE
-    bool reconnect();
-#endif
 char ** returnPlaylistFromWebstream(const char *_webUrl);
 char ** returnPlaylistFromSD(File _fileOrDirectory);
 void rfidScanner(void *parameter);
@@ -405,10 +404,15 @@ void rfidPreferenceLookupHandler (void);
 void sendWebsocketData(uint32_t client, uint8_t code);
 void setupVolume(void);
 void trackQueueDispatcher(const char *_sdFile, const uint32_t _lastPlayPos, const uint32_t _playMode, const uint16_t _trackLastPlayed);
-void volumeHandler(const int32_t _minVolume, const int32_t _maxVolume);
-void volumeToQueueSender(const int32_t _newVolume);
+#ifdef USEROTARY_ENABLE
+    void rotaryVolumeHandler(const int32_t _minVolume, const int32_t _maxVolume);
+#endif
+void volumeToQueueSender(const int32_t _newVolume, bool reAdjustRotary);
 wl_status_t wifiManager(void);
 bool writeWifiStatusToNVS(bool wifiStatus);
+void bluetoothHandler(void);
+uint8_t readOperationModeFromNVS(void);
+bool setOperationMode(uint8_t operationMode);
 
 
 /* Wrapper-function for serial-logging (with newline)
@@ -462,7 +466,7 @@ void IRAM_ATTR onTimer() {
             recoverLastRfid = false;
             String lastRfidPlayed = prefsSettings.getString("lastRfid", "-1");
             if (!lastRfidPlayed.compareTo("-1")) {
-                loggerNl(serialDebug,((char *) FPSTR(unableToRestoreLastRfidFromNVS), LOGLEVEL_INFO);
+                loggerNl(serialDebug,(char *) FPSTR(unableToRestoreLastRfidFromNVS), LOGLEVEL_INFO);
             } else {
                 char *lastRfid = strdup(lastRfidPlayed.c_str());
                 xQueueSend(rfidCardQueue, &lastRfid, 0);
@@ -472,173 +476,6 @@ void IRAM_ATTR onTimer() {
         }
     }
 #endif
-
-// Creates a new file on the SD-card.
-void createFile(fs::FS &fs, const char * path, const char * message) {
-    snprintf(logBuf, serialLoglength, "%s: %s", (char *) FPSTR(writingFile), path);
-    loggerNl(serialDebug, logBuf, LOGLEVEL_DEBUG);
-    File file = fs.open(path, FILE_WRITE);
-    if (!file) {
-        snprintf(logBuf, serialLoglength, "%s", (char *) FPSTR(failedOpenFileForWrite));
-        loggerNl(serialDebug, logBuf, LOGLEVEL_ERROR);
-        return;
-    }
-    if (file.print(message)) {
-        snprintf(logBuf, serialLoglength, "%s", (char *) FPSTR(fileWritten));
-        loggerNl(serialDebug, logBuf, LOGLEVEL_DEBUG);
-    } else {
-        snprintf(logBuf, serialLoglength, "%s", (char *) FPSTR(writeFailed));
-        loggerNl(serialDebug, logBuf, LOGLEVEL_ERROR);
-    }
-    file.close();
-}
-
-
-bool fileExists(fs::FS &fs, const char *file) {
-    return fs.exists(file);
-}
-
-// Appends raw input to a file
-void appendToFile(fs::FS &fs, const char *path, const char *text) {
-    File file = fs.open(path, FILE_APPEND);
-    esp_task_wdt_reset();
-    file.print(text);
-    file.close();
-}
-
-// indicates if the given node is first node of file
-bool isFirstJSONtNode = true;
-
-// Helper-function for writing file-index to json-file.
-// This function appends a new json-node for files/directories to a given file
-void appendNodeToJSONFile(fs::FS &fs, const char * path, const char *filename, const char *parent, const char *type ) {
-    // Serial.printf("Appending to file: %s\n", path);
-    snprintf(logBuf, serialLoglength, "%s: %s\n", (char *) FPSTR(listingDirectory), filename);
-    loggerNl(serialDebug, logBuf, LOGLEVEL_DEBUG);
-    File file = fs.open(path, FILE_APPEND);
-    // i/o is timing critical keep all stuff running
-    esp_task_wdt_reset();
-    if (!file) {
-        snprintf(logBuf, serialLoglength, (char *) FPSTR(failedToOpenFileForAppending));
-        loggerNl(serialDebug, logBuf, LOGLEVEL_DEBUG);
-        return;
-    }
-
-    if (!isFirstJSONtNode) {
-        file.print(",");
-    }
-
-    //TODO: write a minified json, without all those whitespaces
-    //      it is just easier to debug when json is in a nice format
-    //      anyway ugly but works and is stable
-    file.print(F("{\"id\":\""));
-    file.print(filename);
-    file.print(F("\",\"parent\":\""));
-    file.print(parent);
-    file.print(F("\",\"type\":\""));
-    file.print(type);
-    file.print(F("\",\"text\":\""));
-    file.print(filename);
-    file.print(F("\"}"));
-    // i/o is timing critical keep all stuff running
-    esp_task_wdt_reset();
-    yield();
-    file.close();
-
-    if (isFirstJSONtNode) {
-        isFirstJSONtNode = false;
-    }
-}
-
-// Checks if a path is valid. (e.g. hidden path is not valid)
-bool pathValid(const char *_fileItem) {
-    const char ch = '/';
-    char *subst;
-    subst = strrchr(_fileItem, ch);     // Don't use files that start with .
-    return (!startsWith(subst, (char *) "/."));
-}
-
-// SD-Card index-parser. Parses the SD-card directories by a given filepath-depth recursively and appends the
-// found files and directories to files.json-file.
-char *fileNameBuf = (char *) calloc(255, sizeof(char));         // In heap to save static memory
-
-void parseSDFileList(fs::FS &fs, const char * dirname, const char * parent, uint8_t levels) {
-    esp_task_wdt_reset();
-
-    yield();
-    File root = fs.open(dirname);
-
-    if (!root) {
-        snprintf(logBuf, serialLoglength, (char *) FPSTR(failedToOpenDirectory));
-        loggerNl(serialDebug, logBuf, LOGLEVEL_DEBUG);
-        return;
-    }
-
-    if (!root.isDirectory()) {
-        snprintf(logBuf, serialLoglength, (char *) FPSTR(notADirectory));
-        loggerNl(serialDebug, logBuf, LOGLEVEL_DEBUG);
-        return;
-    }
-    File file = root.openNextFile();
-
-    while(file) {
-        esp_task_wdt_reset();
-        const char *parent;
-
-        if (strcmp(root.name(), "/") == 0 || root.name() == 0) {
-            parent = "#\0";
-        } else {
-            parent = root.name();
-        }
-        if (file.name() == 0 ) {
-            continue;
-        }
-
-        strncpy(fileNameBuf, (char *) file.name(), 255);
-
-        // we have a folder
-        if(file.isDirectory()) {
-
-            esp_task_wdt_reset();
-            if (pathValid(fileNameBuf)) {
-                sendWebsocketData(0, 31);
-                appendNodeToJSONFile(FSystem, DIRECTORY_INDEX_FILE, fileNameBuf, parent, "folder" );
-                // check for next subfolder
-                if(levels){
-                    parseSDFileList(fs, fileNameBuf, root.name(), levels -1);
-                }
-            }
-        // we have a file
-        } else {
-
-            if (fileValid(fileNameBuf)) {
-                appendNodeToJSONFile(fs, DIRECTORY_INDEX_FILE, fileNameBuf, parent, "file" );
-            }
-        }
-        vTaskDelay(portTICK_PERIOD_MS*50);
-        file = root.openNextFile();
-        // i/o is timing critical keep all stuff running
-        esp_task_wdt_reset();
-    }
-
-}
-
-// Public function for creating file-index json on SD-card. It notifies the user-client
-// via websockets when the indexing is done.
-void createJSONFileList() {
-    createFile(FSystem, DIRECTORY_INDEX_FILE, "[");
-    parseSDFileList(FSystem,  "/", NULL, FS_DEPTH);
-    appendToFile(FSystem, DIRECTORY_INDEX_FILE, "]");
-    isFirstJSONtNode  =  true;
-    sendWebsocketData(0,30);
-}
-
-
-void fileHandlingTask(void *arguments) {
-    createJSONFileList();
-    esp_task_wdt_reset();
-    vTaskDelete( NULL );
-}
 
 
 #ifdef MEASURE_BATTERY_VOLTAGE
@@ -686,10 +523,24 @@ void buttonHandler() {
             return;
         }
         unsigned long currentTimestamp = millis();
-        buttons[0].currentState = digitalRead(NEXT_BUTTON);
-        buttons[1].currentState = digitalRead(PREVIOUS_BUTTON);
-        buttons[2].currentState = digitalRead(PAUSEPLAY_BUTTON);
-        //buttons[3].currentState = digitalRead(DREHENCODER_BUTTON);
+        #ifdef BUTTON_0_ENABLE
+            buttons[0].currentState = digitalRead(NEXT_BUTTON);
+        #endif
+        #ifdef BUTTON_1_ENABLE
+            buttons[1].currentState = digitalRead(PREVIOUS_BUTTON);
+        #endif
+        #ifdef BUTTON_2_ENABLE
+            buttons[2].currentState = digitalRead(PAUSEPLAY_BUTTON);
+        #endif
+        #ifdef BUTTON_3_ENABLE
+            buttons[3].currentState = digitalRead(DREHENCODER_BUTTON);
+        #endif
+        #ifdef BUTTON_4_ENABLE
+            buttons[4].currentState = digitalRead(BUTTON_4);
+        #endif
+        #ifdef BUTTON_5_ENABLE
+            buttons[5].currentState = digitalRead(BUTTON_5);
+        #endif
 
         // Iterate over all buttons in struct-array
         for (uint8_t i=0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
@@ -714,105 +565,157 @@ void doButtonActions(void) {
         return; // Avoid button-handling if buttons are locked
     }
 
-    // WiFi-toggle
     if (buttons[0].isPressed && buttons[1].isPressed) {
-        if (!wifiStatusToggledTimestamp || (millis() - wifiStatusToggledTimestamp >= 2000)) {
-            wifiStatusToggledTimestamp = millis();
-            buttons[0].isPressed = false;
-            buttons[1].isPressed = false;
-            if (writeWifiStatusToNVS(!getWifiEnableStatusFromNVS())) {
-                #ifdef NEOPIXEL_ENABLE
-                    showLedOk = true;       // Tell user action was accepted
-                #endif
-            } else {
-                #ifdef NEOPIXEL_ENABLE
-                    showLedError = true;    // Tell user action failed
-                #endif
-            }
-        }
-        return;
+        buttons[0].isPressed = false;
+        buttons[1].isPressed = false;
+        doCmdAction(BUTTON_MULTI_01);
     }
+    else if (buttons[0].isPressed && buttons[2].isPressed) {
+        buttons[0].isPressed = false;
+        buttons[2].isPressed = false;
+        doCmdAction(BUTTON_MULTI_02);
+    }
+    else if (buttons[0].isPressed && buttons[3].isPressed) {
+        buttons[0].isPressed = false;
+        buttons[3].isPressed = false;
+        doCmdAction(BUTTON_MULTI_03);
+    }
+    else if (buttons[0].isPressed && buttons[4].isPressed) {
+        buttons[0].isPressed = false;
+        buttons[4].isPressed = false;
+        doCmdAction(BUTTON_MULTI_04);
+    }
+    else if (buttons[0].isPressed && buttons[5].isPressed) {
+        buttons[0].isPressed = false;
+        buttons[5].isPressed = false;
+        doCmdAction(BUTTON_MULTI_05);
+    }
+    else if (buttons[1].isPressed && buttons[2].isPressed) {
+        buttons[1].isPressed = false;
+        buttons[2].isPressed = false;
+        doCmdAction(BUTTON_MULTI_12);
+    }
+    else if (buttons[1].isPressed && buttons[3].isPressed) {
+        buttons[1].isPressed = false;
+        buttons[3].isPressed = false;
+        doCmdAction(BUTTON_MULTI_13);
+    }
+    else if (buttons[1].isPressed && buttons[4].isPressed) {
+        buttons[1].isPressed = false;
+        buttons[4].isPressed = false;
+        doCmdAction(BUTTON_MULTI_14);
+    }
+    else if (buttons[1].isPressed && buttons[5].isPressed) {
+        buttons[1].isPressed = false;
+        buttons[5].isPressed = false;
+        doCmdAction(BUTTON_MULTI_15);
+    }
+    else if (buttons[2].isPressed && buttons[3].isPressed) {
+        buttons[2].isPressed = false;
+        buttons[3].isPressed = false;
+        doCmdAction(BUTTON_MULTI_23);
+    }
+    else if (buttons[2].isPressed && buttons[4].isPressed) {
+        buttons[2].isPressed = false;
+        buttons[4].isPressed = false;
+        doCmdAction(BUTTON_MULTI_24);
+    }
+    else if (buttons[2].isPressed && buttons[5].isPressed) {
+        buttons[2].isPressed = false;
+        buttons[5].isPressed = false;
+        doCmdAction(BUTTON_MULTI_25);
+    }
+    else if (buttons[3].isPressed && buttons[4].isPressed) {
+        buttons[3].isPressed = false;
+        buttons[4].isPressed = false;
+        doCmdAction(BUTTON_MULTI_34);
+    }
+    else if (buttons[3].isPressed && buttons[5].isPressed) {
+        buttons[3].isPressed = false;
+        buttons[5].isPressed = false;
+        doCmdAction(BUTTON_MULTI_35);
+    }
+    else if (buttons[4].isPressed && buttons[5].isPressed) {
+        buttons[4].isPressed = false;
+        buttons[5].isPressed = false;
+        doCmdAction(BUTTON_MULTI_45);
+    }
+    else {
+        for (uint8_t i=0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
+            if (buttons[i].isPressed) {
+                if (buttons[i].lastReleasedTimestamp > buttons[i].lastPressedTimestamp) {
+                    if (buttons[i].lastReleasedTimestamp - buttons[i].lastPressedTimestamp >= intervalToLongPress) {
+                        switch (i)      // Long-press-actions
+                        {
+                        case 0:
+                            doCmdAction(BUTTON_0_LONG);
+                            buttons[i].isPressed = false;
+                            break;
 
-    // FTP-enable
-    #ifdef FTP_ENABLE
-        if (!ftpEnableLastStatus && !ftpEnableCurrentStatus) {
-            if (buttons[0].isPressed && buttons[2].isPressed) {
-                buttons[0].isPressed = false;
-                buttons[2].isPressed = false;
-                ftpEnableLastStatus = true;
-                #ifdef NEOPIXEL_ENABLE
-                    showLedOk = true;
-                #endif
-            return;
-           }
-        }
-    #endif
+                        case 1:
+                            doCmdAction(BUTTON_1_LONG);
+                            buttons[i].isPressed = false;
+                            break;
 
-    for (uint8_t i=0; i < sizeof(buttons) / sizeof(buttons[0]); i++) {
-        if (buttons[i].isPressed) {
-            if (buttons[i].lastReleasedTimestamp > buttons[i].lastPressedTimestamp) {
-                if (buttons[i].lastReleasedTimestamp - buttons[i].lastPressedTimestamp >= intervalToLongPress) {
-                    switch (i)      // Long-press-actions
-                    {
-                    case 0:
-                        trackControlToQueueSender(LASTTRACK);
-                        buttons[i].isPressed = false;
-                        break;
+                        case 2:
+                            doCmdAction(BUTTON_2_LONG);
+                            buttons[i].isPressed = false;
+                            break;
 
-                    case 1:
-                        trackControlToQueueSender(FIRSTTRACK);
-                        buttons[i].isPressed = false;
-                        break;
+                        case 3:
+                            doCmdAction(BUTTON_3_LONG);
+                            buttons[i].isPressed = false;
+                            break;
 
-                    case 2:
-                        trackControlToQueueSender(PAUSEPLAY);
-                        buttons[i].isPressed = false;
-                        break;
+                        case 4:
+                            doCmdAction(BUTTON_4_LONG);
+                            buttons[i].isPressed = false;
+                            break;
 
-                    case 3:
-                        gotoSleep = true;
-                        break;
-                    }
-                } else {
-                    switch (i)      // Short-press-actions
-                    {
-                    case 0:
-                        trackControlToQueueSender(NEXTTRACK);
-                        buttons[i].isPressed = false;
-                        break;
+                        case 5:
+                            doCmdAction(BUTTON_5_LONG);
+                            buttons[i].isPressed = false;
+                            break;
+                        }
+                    } else {
+                        switch (i)      // Short-press-actions
+                        {
+                        case 0:
+                            doCmdAction(BUTTON_0_SHORT);
+                            buttons[i].isPressed = false;
+                            break;
 
-                    case 1:
-                        trackControlToQueueSender(PREVIOUSTRACK);
-                        buttons[i].isPressed = false;
-                        break;
+                        case 1:
+                            doCmdAction(BUTTON_1_SHORT);
+                            buttons[i].isPressed = false;
+                            break;
 
-                    case 2:
-                        trackControlToQueueSender(PAUSEPLAY);
-                        buttons[i].isPressed = false;
-                        break;
+                        case 2:
+                            doCmdAction(BUTTON_2_SHORT);
+                            buttons[i].isPressed = false;
+                            break;
 
-                    case 3:
-                        buttons[i].isPressed = false;
-                        #ifdef MEASURE_BATTERY_VOLTAGE
-                            float voltage = measureBatteryVoltage();
-                            snprintf(logBuf, serialLoglength, "%s: %.2f V", (char *) FPSTR(currentVoltageMsg), voltage);
-                            loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
-                            #ifdef NEOPIXEL_ENABLE
-                                showLedVoltage = true;
-                            #endif
-                            #ifdef MQTT_ENABLE
-                                char vstr[6];
-                                snprintf(vstr, 6, "%.2f", voltage);
-                                publishMqtt((char *) FPSTR(topicBatteryVoltage), vstr, false);
-                            #endif
-                        #endif
+                        case 3:
+                            doCmdAction(BUTTON_3_SHORT);
+                            buttons[i].isPressed = false;
+                            break;
+
+                        case 4:
+                            doCmdAction(BUTTON_4_SHORT);
+                            buttons[i].isPressed = false;
+                            break;
+
+                        case 5:
+                            doCmdAction(BUTTON_5_SHORT);
+                            buttons[i].isPressed = false;
+                            break;
+                        }
                     }
                 }
             }
         }
     }
 }
-
 
 /* Wrapper-functions for MQTT-publish */
 #ifdef MQTT_ENABLE
@@ -847,8 +750,8 @@ bool publishMqtt(const char *topic, uint32_t payload, bool retained) {
 }
 
 
-/* Cyclic posting via MQTT that ESP is still alive. Use case: when Tonuino is switched off, it will post via
-   MQTT it's gonna be offline now. But when unplugging Tonuino e.g. openHAB doesn't know Tonuino is offline.
+/* Cyclic posting via MQTT that ESP is still alive. Use case: when ESPuino is switched off, it will post via
+   MQTT it's gonna be offline now. But when unplugging ESPuino e.g. openHAB doesn't know ESPuino is offline.
    One way to recognize this is to determine, when a topic has been updated for the last time. So by
    telling openHAB connection is timed out after 2mins for instance, this is the right topic to check for.  */
 void postHeartbeatViaMqtt(void) {
@@ -966,9 +869,7 @@ void callback(const char *topic, const byte *payload, uint32_t length) {
     // Loudness to change?
     else if (strcmp_P(topic, topicLoudnessCmnd) == 0) {
         unsigned long vol = strtoul(receivedString, NULL, 10);
-        volumeToQueueSender(vol);
-        encoder.clearCount();
-        encoder.setCount(vol * 2);      // Update encoder-value to keep it in-sync with MQTT-updates
+        volumeToQueueSender(vol, true);
     }
     // Modify sleep-timer?
     else if (strcmp_P(topic, topicSleepTimerCmnd) == 0) {
@@ -1243,6 +1144,8 @@ bool fileValid(const char *_fileItem) {
         (endsWith(_fileItem, ".mp3") || endsWith(_fileItem, ".MP3") ||
          endsWith(_fileItem, ".aac") || endsWith(_fileItem, ".AAC") ||
          endsWith(_fileItem, ".m3u") || endsWith(_fileItem, ".M3U") ||
+         endsWith(_fileItem, ".m4a") || endsWith(_fileItem, ".M4A") ||
+         endsWith(_fileItem, ".wav") || endsWith(_fileItem, ".WAV") ||
          endsWith(_fileItem, ".asx") || endsWith(_fileItem, ".ASX"));
 }
 
@@ -1257,7 +1160,12 @@ char ** returnPlaylistFromWebstream(const char *_webUrl) {
         freeMultiCharArray(url, strtoul(*url, NULL, 10));
     }
 
-    url = (char **) malloc(sizeof(char *) * 2);
+    if (psramInit()) {
+        url = (char **) ps_malloc(sizeof(char *) * 2);
+    } else {
+        url = (char **) malloc(sizeof(char *) * 2);
+    }
+
     url[0] = strdup("1");         // Number of files is always 1 in url-mode
     url[1] = strdup(webUrl);
 
@@ -1290,7 +1198,11 @@ char ** returnPlaylistFromSD(File _fileOrDirectory) {
 
     // File-mode
     if (!_fileOrDirectory.isDirectory()) {
-        files = (char **) malloc(sizeof(char *) * 2);        // +1 because [0] is used for number of elements; [1] -> [n] is used for payload
+        if (psramInit()) {
+            files = (char **) ps_malloc(sizeof(char *) * 2);
+        } else {
+            files = (char **) malloc(sizeof(char *) * 2);        // +1 because [0] is used for number of elements; [1] -> [n] is used for payload
+        }
         if (files == NULL) {
             loggerNl(serialDebug, (char *) FPSTR(unableToAllocateMemForPlaylist), LOGLEVEL_ERROR);
             #ifdef NEOPIXEL_ENABLE
@@ -1301,7 +1213,12 @@ char ** returnPlaylistFromSD(File _fileOrDirectory) {
         loggerNl(serialDebug, (char *) FPSTR(fileModeDetected), LOGLEVEL_INFO);
         strncpy(fileNameBuf, (char *) _fileOrDirectory.name(), sizeof(fileNameBuf) / sizeof(fileNameBuf[0]));
         if (fileValid(fileNameBuf)) {
-            files = (char **) malloc(sizeof(char *) * 2);
+            if (psramInit()) {
+                files = (char **) ps_malloc(sizeof(char *) * 2);
+            } else {
+                files = (char **) malloc(sizeof(char *) * 2);
+            }
+
             files[1] = strdup(fileNameBuf);
         }
         files[0] = strdup("1");         // Number of files is always 1 in file-mode
@@ -1312,7 +1229,14 @@ char ** returnPlaylistFromSD(File _fileOrDirectory) {
     // Directory-mode
     uint16_t allocCount = 1;
     uint16_t allocSize = 512;
-    char *serializedPlaylist = (char*) calloc(allocSize, sizeof(char));
+    char *serializedPlaylist;
+
+    if (psramInit()) {
+        serializedPlaylist = (char*) ps_calloc(allocSize, sizeof(char));
+    } else {
+        serializedPlaylist = (char*) calloc(allocSize, sizeof(char));
+    }
+
 
     while (true) {
        File fileItem = _fileOrDirectory.openNextFile();
@@ -1354,7 +1278,12 @@ char ** returnPlaylistFromSD(File _fileOrDirectory) {
     }
 
     // Alloc only necessary number of playlist-pointers
-    files = (char **) malloc(sizeof(char *) * cnt + 1);
+    if (psramInit()) {
+        files = (char **) ps_malloc(sizeof(char *) * cnt + 1);
+    } else {
+        files = (char **) malloc(sizeof(char *) * cnt + 1);
+    }
+
     if (files == NULL) {
         loggerNl(serialDebug, (char *) FPSTR(unableToAllocateMemForPlaylist), LOGLEVEL_ERROR);
         #ifdef NEOPIXEL_ENABLE
@@ -1375,7 +1304,12 @@ char ** returnPlaylistFromSD(File _fileOrDirectory) {
 
     free(serializedPlaylist);
 
-    files[0] = (char *) malloc(sizeof(char) * 5);
+    if (psramInit()) {
+        files[0] = (char *) ps_malloc(sizeof(char) * 5);
+    } else {
+        files[0] = (char *) malloc(sizeof(char) * 5);
+    }
+
     if (files[0] == NULL) {
         loggerNl(serialDebug, (char *) FPSTR(unableToAllocateMemForPlaylist), LOGLEVEL_ERROR);
         #ifdef NEOPIXEL_ENABLE
@@ -1483,6 +1417,8 @@ void playAudio(void *parameter) {
                 playProperties.trackFinished = false;
                 if (playProperties.playMode == NO_PLAYLIST) {
                     playProperties.playlistFinished = true;
+                    //playProperties.currentSeekmode = SEEK_NORMAL;
+                    //playProperties.lastSeekmode = SEEK_NORMAL;
                     continue;
                 }
                 if (playProperties.saveLastPlayPosition) {     // Don't save for AUDIOBOOK_LOOP because not necessary
@@ -1788,6 +1724,27 @@ void playAudio(void *parameter) {
             }
         }
 
+        if (playProperties.currentSeekmode != playProperties.lastSeekmode) {
+            Serial.println(F("Seekmode has changed!")); // Todo
+            bool seekmodeChangeSuccessful = false;
+            if (playProperties.currentSeekmode == SEEK_NORMAL) {
+                seekmodeChangeSuccessful = audio.audioFileSeek(1);
+            } else if (playProperties.currentSeekmode == SEEK_FORWARDS) {
+                seekmodeChangeSuccessful = audio.audioFileSeek(4);
+            } else if (playProperties.currentSeekmode == SEEK_BACKWARDS) {
+                seekmodeChangeSuccessful = audio.audioFileSeek(-4);
+            }
+
+            if (seekmodeChangeSuccessful) {
+                playProperties.lastSeekmode = playProperties.currentSeekmode;
+            } else {
+                playProperties.currentSeekmode = playProperties.lastSeekmode;
+                #ifdef NEOPIXEL_ENABLE
+                    showLedError = true;
+                #endif
+            }
+        }
+
         // Calculate relative position in file (for neopixel) for SD-card-mode
         #ifdef NEOPIXEL_ENABLE
             if (!playProperties.playlistFinished && playProperties.playMode != WEBSTREAM) {
@@ -1845,7 +1802,12 @@ void rfidScanner(void *parameter) {
             mfrc522.PICC_HaltA();
             mfrc522.PCD_StopCrypto1();
 
-            cardIdString = (char *) malloc(cardIdSize*3 +1);
+            if (psramInit()) {
+                cardIdString = (char *) ps_malloc(cardIdSize*3 +1);
+            } else {
+                cardIdString = (char *) malloc(cardIdSize*3 +1);
+            }
+
             if (cardIdString == NULL) {
                 logger(serialDebug, (char *) FPSTR(unableToAllocateMem), LOGLEVEL_ERROR);
                 #ifdef NEOPIXEL_ENABLE
@@ -1913,7 +1875,12 @@ void rfidScanner(void *parameter) {
             nfc14443.setupRF();
             uint8_t uid[10];
             if (nfc14443.isCardPresent() && nfc14443.readCardSerial(uid)) {
-                cardIdString = (char *) malloc(cardIdSize*3 +1);
+                if (psramInit()) {
+                    cardIdString = (char *) ps_malloc(cardIdSize*3 +1);
+                } else {
+                    cardIdString = (char *) malloc(cardIdSize*3 +1);
+                }
+
                 if (cardIdString == NULL) {
                     logger(serialDebug, (char *) FPSTR(unableToAllocateMem), LOGLEVEL_ERROR);
                     #ifdef NEOPIXEL_ENABLE
@@ -1957,7 +1924,12 @@ void rfidScanner(void *parameter) {
             // try to read ISO15693 inventory
             ISO15693ErrorCode rc = nfc15693.getInventory(uid);
             if (rc == ISO15693_EC_OK) {
-                cardIdString = (char *) malloc(cardIdSize*3 +1);
+                if (psramInit()) {
+                    cardIdString = (char *) ps_malloc(cardIdSize*3 +1);
+                } else {
+                    cardIdString = (char *) malloc(cardIdSize*3 +1);
+                }
+
                 if (cardIdString == NULL) {
                     logger(serialDebug, (char *) FPSTR(unableToAllocateMem), LOGLEVEL_ERROR);
                     #ifdef NEOPIXEL_ENABLE
@@ -2017,24 +1989,32 @@ void showLed(void *parameter) {
     static bool notificationShown = false;
     static bool volumeChangeShown = false;
     static bool showEvenError = false;
+    static bool turnedOffLeds = false;
     static uint8_t ledPosWebstream = 0;
     static uint8_t ledSwitchInterval = 5; // time in secs (webstream-only)
     static uint8_t webstreamColor = 0;
     static unsigned long lastSwitchTimestamp = 0;
     static bool redrawProgress = false;
     static uint8_t lastLedBrightness = ledBrightness;
-
+    static CRGB::HTMLColorCode idleColor;
     static CRGB leds[NUM_LEDS];
     FastLED.addLeds<CHIPSET , LED_PIN, COLOR_ORDER>(leds, NUM_LEDS).setCorrection( TypicalSMD5050 );
     FastLED.setBrightness(ledBrightness);
 
     for (;;) {
-        #ifdef NEOPIXEL_ENABLE
-            if (pauseNeopixel) { // Workaround to prevent exceptions while NVS-writes take place
-                vTaskDelay(portTICK_RATE_MS*10);
-                continue;
+        if (pauseNeopixel) { // Workaround to prevent exceptions while NVS-writes take place
+            vTaskDelay(portTICK_RATE_MS*10);
+            continue;
+        }
+        if (gotoSleep) { // If deepsleep is planned, turn off LEDs first in order to avoid LEDs still glowing when ESP32 is in deepsleep
+            if (!turnedOffLeds) {
+                FastLED.clear();
+                turnedOffLeds = true;
             }
-        #endif
+
+            vTaskDelay(portTICK_RATE_MS*10);
+            continue;
+        }
         if (!bootComplete) {                    // Rotates orange unless boot isn't complete
             FastLED.clear();
             for (uint8_t led = 0; led < NUM_LEDS; led++) {
@@ -2068,18 +2048,26 @@ void showLed(void *parameter) {
             lastLedBrightness = ledBrightness;
         }
 
-        if (!buttons[3].currentState) {
-            FastLED.clear();
-            for (uint8_t led = 0; led < NUM_LEDS; led++) {
-                leds[ledAddress(led)] = CRGB::Red;
-                if (buttons[3].currentState) {
+        // LEDs growing red as long button for sleepmode is pressed.
+        if (shutdownButton < (sizeof(buttons) / sizeof(buttons[0])) - 1) {      // Only show animation, if CMD_SLEEPMODE was assigned to BUTTON_n_LONG + button is pressed
+            if (!buttons[shutdownButton].currentState) {
+                FastLED.clear();
+                for (uint8_t led = 0; led < NUM_LEDS; led++) {
+                    leds[ledAddress(led)] = CRGB::Red;
+                    if (buttons[shutdownButton].currentState) {
+                        FastLED.show();
+                        delay(5);
+                        deepSleepManager();
+                        break;
+                    }
                     FastLED.show();
-                    delay(5);
-                    deepSleepManager();
-                    break;
+                    vTaskDelay(intervalToLongPress / NUM_LEDS * portTICK_RATE_MS);
                 }
-                FastLED.show();
-                vTaskDelay(intervalToLongPress / NUM_LEDS * portTICK_RATE_MS);
+            }
+        } else {
+            shutdownButton = (sizeof(buttons) / sizeof(buttons[0])) - 1;    // If CMD_SLEEPMODE was not assigned to an enabled button, dummy-button is used
+            if (!buttons[shutdownButton].currentState) {
+                buttons[shutdownButton].currentState = true;
             }
         }
 
@@ -2154,7 +2142,7 @@ void showLed(void *parameter) {
                     }
 
                     for (uint8_t i=0; i<=100; i++) {
-                        if (hlastVolume != currentVolume || showLedError || showLedOk || !buttons[3].currentState) {
+                        if (hlastVolume != currentVolume || showLedError || showLedOk || !buttons[shutdownButton].currentState || gotoSleep) {
                             break;
                         }
 
@@ -2176,7 +2164,7 @@ void showLed(void *parameter) {
             FastLED.show();
 
             for (uint8_t i=0; i<=50; i++) {
-                if (hlastVolume != currentVolume || showLedError || showLedOk || !buttons[3].currentState) {
+                if (hlastVolume != currentVolume || showLedError || showLedOk || !buttons[shutdownButton].currentState || gotoSleep) {
                     if (hlastVolume != currentVolume) {
                         volumeChangeShown = false;
                     }
@@ -2192,7 +2180,7 @@ void showLed(void *parameter) {
             for (uint8_t i=NUM_LEDS-1; i>0; i--) {
                 leds[ledAddress(i)] = CRGB::Black;
                 FastLED.show();
-                if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || !buttons[3].currentState) {
+                if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || !buttons[shutdownButton].currentState || gotoSleep) {
                     break;
                 } else {
                     vTaskDelay(portTICK_RATE_MS*30);
@@ -2209,9 +2197,9 @@ void showLed(void *parameter) {
                     leds[ledAddress(i)] = CRGB::Blue;
                     FastLED.show();
                     #ifdef MEASURE_BATTERY_VOLTAGE
-                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || showVoltageWarning || showLedVoltage || !buttons[3].currentState) {
+                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || showVoltageWarning || showLedVoltage || !buttons[shutdownButton].currentState || gotoSleep) {
                     #else
-                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || !buttons[3].currentState) {
+                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || !buttons[shutdownButton].currentState || gotoSleep) {
                     #endif
                         break;
                     } else {
@@ -2221,9 +2209,9 @@ void showLed(void *parameter) {
 
                 for (uint8_t i=0; i<=100; i++) {
                     #ifdef MEASURE_BATTERY_VOLTAGE
-                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || showVoltageWarning || showLedVoltage || !buttons[3].currentState) {
+                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || showVoltageWarning || showLedVoltage || !buttons[shutdownButton].currentState || gotoSleep) {
                     #else
-                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || !buttons[3].currentState) {
+                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || !buttons[shutdownButton].currentState || gotoSleep) {
                     #endif
                         break;
                     } else {
@@ -2235,9 +2223,9 @@ void showLed(void *parameter) {
                     leds[ledAddress(i)-1] = CRGB::Black;
                     FastLED.show();
                     #ifdef MEASURE_BATTERY_VOLTAGE
-                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || showVoltageWarning || showLedVoltage || !buttons[3].currentState) {
+                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || showVoltageWarning || showLedVoltage || !buttons[shutdownButton].currentState || gotoSleep) {
                     #else
-                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || !buttons[3].currentState) {
+                        if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || !buttons[shutdownButton].currentState || gotoSleep) {
                     #endif
                         break;
                     } else {
@@ -2249,26 +2237,39 @@ void showLed(void *parameter) {
 
         switch (playProperties.playMode) {
             case NO_PLAYLIST:                   // If no playlist is active (idle)
+                #ifdef BLUETOOTH_ENABLE
+                if(operationMode == OPMODE_BLUETOOTH ) {
+                    idleColor = CRGB::Blue;
+                } else  {
+                #endif
+                    if(wifiManager() == WL_CONNECTED) {
+                        idleColor = CRGB::White;
+                    } else {
+                        idleColor = CRGB::Green;
+                    }
+                #ifdef BLUETOOTH_ENABLE
+                }
+                #endif
                 if (hlastVolume == currentVolume && lastLedBrightness == ledBrightness) {
                     for (uint8_t i=0; i<NUM_LEDS; i++) {
                         FastLED.clear();
                         if (ledAddress(i) == 0) {       // White if Wifi is enabled and blue if not
-                            leds[0] = (wifiManager() == WL_CONNECTED) ? CRGB::White : CRGB::Blue;
-                            leds[NUM_LEDS/4] = (wifiManager() == WL_CONNECTED) ? CRGB::White : CRGB::Blue;
-                            leds[NUM_LEDS/2] = (wifiManager() == WL_CONNECTED) ? CRGB::White : CRGB::Blue;
-                            leds[NUM_LEDS/4*3] = (wifiManager() == WL_CONNECTED) ? CRGB::White : CRGB::Blue;
+                            leds[0]            = idleColor;
+                            leds[NUM_LEDS/4]   = idleColor;
+                            leds[NUM_LEDS/2]   = idleColor;
+                            leds[NUM_LEDS/4*3] = idleColor;
                         } else {
-                            leds[ledAddress(i) % NUM_LEDS] = (wifiManager() == WL_CONNECTED) ? CRGB::White : CRGB::Blue;
-                            leds[(ledAddress(i)+NUM_LEDS/4) % NUM_LEDS] = (wifiManager() == WL_CONNECTED) ? CRGB::White : CRGB::Blue;
-                            leds[(ledAddress(i)+NUM_LEDS/2) % NUM_LEDS] = (wifiManager() == WL_CONNECTED) ? CRGB::White : CRGB::Blue;
-                            leds[(ledAddress(i)+NUM_LEDS/4*3) % NUM_LEDS] = (wifiManager() == WL_CONNECTED) ? CRGB::White : CRGB::Blue;
+                            leds[ledAddress(i) % NUM_LEDS]                = idleColor;
+                            leds[(ledAddress(i)+NUM_LEDS/4) % NUM_LEDS]   = idleColor;
+                            leds[(ledAddress(i)+NUM_LEDS/2) % NUM_LEDS]   = idleColor;
+                            leds[(ledAddress(i)+NUM_LEDS/4*3) % NUM_LEDS] = idleColor;
                         }
                         FastLED.show();
                         for (uint8_t i=0; i<=50; i++) {
                             #ifdef MEASURE_BATTERY_VOLTAGE
-                                if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || showVoltageWarning || showLedVoltage || playProperties.playMode != NO_PLAYLIST || !buttons[3].currentState) {
+                                if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || showVoltageWarning || showLedVoltage || playProperties.playMode != NO_PLAYLIST || !buttons[shutdownButton].currentState || gotoSleep) {
                             #else
-                                if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || playProperties.playMode != NO_PLAYLIST || !buttons[3].currentState) {
+                                if (hlastVolume != currentVolume || lastLedBrightness != ledBrightness || showLedError || showLedOk || playProperties.playMode != NO_PLAYLIST || !buttons[shutdownButton].currentState || gotoSleep) {
                             #endif
                                 break;
                             } else {
@@ -2305,9 +2306,9 @@ void showLed(void *parameter) {
             default:                            // If playlist is active (doesn't matter which type)
                 if (!playProperties.playlistFinished) {
                     #ifdef MEASURE_BATTERY_VOLTAGE
-                        if (playProperties.pausePlay != lastPlayState || lockControls != lastLockState || notificationShown || ledBusyShown || volumeChangeShown || showVoltageWarning || showLedVoltage || !buttons[3].currentState) {
+                        if (playProperties.pausePlay != lastPlayState || lockControls != lastLockState || notificationShown || ledBusyShown || volumeChangeShown || showVoltageWarning || showLedVoltage || !buttons[shutdownButton].currentState || gotoSleep) {
                     #else
-                        if (playProperties.pausePlay != lastPlayState || lockControls != lastLockState || notificationShown || ledBusyShown || volumeChangeShown || !buttons[3].currentState) {
+                        if (playProperties.pausePlay != lastPlayState || lockControls != lastLockState || notificationShown || ledBusyShown || volumeChangeShown || !buttons[shutdownButton].currentState || gotoSleep) {
                     #endif
                         lastPlayState = playProperties.pausePlay;
                         lastLockState = lockControls;
@@ -2417,7 +2418,7 @@ void gotoLPCD() {
     if (nfc.switchToLPCD(wakeupCounterInMs)) {
         Serial.println(F("switch to low power card detection: success"));
         // configure wakeup pin for deep-sleep wake-up, use ext1
-        esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+        esp_sleep_enable_ext1_wakeup((1ULL<<(RFID_IRQ)), ESP_EXT1_WAKEUP_ANY_HIGH);
         // freeze pin states in deep sleep
         gpio_hold_en(gpio_num_t(RFID_CS));  // CS/NSS
         gpio_hold_en(gpio_num_t(RFID_RST)); // RST
@@ -2469,14 +2470,24 @@ void deepSleepManager(void) {
 
 
 // Adds new volume-entry to volume-queue
-void volumeToQueueSender(const int32_t _newVolume) {
+// If volume is changed via webgui or MQTT, it's necessary to re-adjust current value of rotary-encoder.
+void volumeToQueueSender(const int32_t _newVolume, bool reAdjustRotary) {
     uint32_t _volume;
-    if (_newVolume <= minVolume) {
-        _volume = minVolume;
+    if (_newVolume < minVolume) {
+        loggerNl(serialDebug, (char *) FPSTR(minLoudnessReached), LOGLEVEL_INFO);
+        return;
     } else if (_newVolume > maxVolume) {
-        _volume = maxVolume;
+        loggerNl(serialDebug, (char *) FPSTR(maxLoudnessReached), LOGLEVEL_INFO);
+        return;
     } else {
         _volume = _newVolume;
+        currentVolume = _volume;
+        #ifdef USEROTARY_ENABLE
+            if (reAdjustRotary) {
+                encoder.clearCount();
+                encoder.setCount(currentVolume * 2);
+            }
+        #endif
     }
     xQueueSend(volumeQueue, &_volume, 0);
 }
@@ -2548,15 +2559,31 @@ void volumeHandler(const int32_t _minVolume, const int32_t _maxVolume) {
             currentEncoderValue = encoder.getCount();
         } else if (currentEncoderValue < _minVolume) {
             encoder.clearCount();
-            encoder.setCount(_minVolume);
-            loggerNl(serialDebug, (char *) FPSTR(minLoudnessReached), LOGLEVEL_INFO);
-            currentEncoderValue = encoder.getCount();
+            encoder.setCount(currentVolume*2);
+            return;
         }
-        lastEncoderValue = currentEncoderValue;
-        currentVolume = lastEncoderValue / 2;
-        if (currentVolume != lastVolume) {
-            lastVolume = currentVolume;
-            volumeToQueueSender(currentVolume);
+
+        currentEncoderValue = encoder.getCount();
+        // Only if initial run or value has changed. And only after "full step" of rotary encoder
+        if (((lastEncoderValue != currentEncoderValue) || lastVolume == -1) && (currentEncoderValue % 2 == 0)) {
+            lastTimeActiveTimestamp = millis();        // Set inactive back if rotary encoder was used
+            if (_maxVolume * 2 < currentEncoderValue) {
+                encoder.clearCount();
+                encoder.setCount(_maxVolume * 2);
+                loggerNl(serialDebug, (char *) FPSTR(maxLoudnessReached), LOGLEVEL_INFO);
+                currentEncoderValue = encoder.getCount();
+            } else if (currentEncoderValue < _minVolume) {
+                encoder.clearCount();
+                encoder.setCount(_minVolume);
+                loggerNl(serialDebug, (char *) FPSTR(minLoudnessReached), LOGLEVEL_INFO);
+                currentEncoderValue = encoder.getCount();
+            }
+            lastEncoderValue = currentEncoderValue;
+            currentVolume = lastEncoderValue / 2;
+            if (currentVolume != lastVolume) {
+                lastVolume = currentVolume;
+                volumeToQueueSender(currentVolume, false);
+            }
         }
     } 
     **/
@@ -2566,7 +2593,13 @@ void volumeHandler(const int32_t _minVolume, const int32_t _maxVolume) {
 // Receives de-serialized RFID-data (from NVS) and dispatches playlists for the given
 // playmode to the track-queue.
 void trackQueueDispatcher(const char *_itemToPlay, const uint32_t _lastPlayPos, const uint32_t _playMode, const uint16_t _trackLastPlayed) {
-    char *filename = (char *) malloc(sizeof(char) * 255);
+    char *filename;
+    if (psramInit()) {
+        filename = (char *) ps_malloc(sizeof(char) * 255);
+    } else {
+        filename = (char *) malloc(sizeof(char) * 255);
+    }
+
     strncpy(filename, _itemToPlay, 255);
     playProperties.startAtFilePos = _lastPlayPos;
     playProperties.currentTrackNumber = _trackLastPlayed;
@@ -2751,8 +2784,12 @@ void doRfidCardModifications(const uint32_t mod) {
         }
 	#endif
 
+    doCmdAction(mod);
+}
+
+void doCmdAction(const uint16_t mod) {
     switch (mod) {
-        case LOCK_BUTTONS_MOD:      // Locks/unlocks all buttons
+        case LOCK_BUTTONS_MOD: {     // Locks/unlocks all buttons
             lockControls = !lockControls;
             if (lockControls) {
                 loggerNl(serialDebug, (char *) FPSTR(modificatorAllButtonsLocked), LOGLEVEL_NOTICE);
@@ -2767,13 +2804,11 @@ void doRfidCardModifications(const uint32_t mod) {
                 #ifdef MQTT_ENABLE
                     publishMqtt((char *) FPSTR(topicLockControlsState), "OFF", false);
                 #endif
-                #ifdef NEOPIXEL_ENABLE
-                    showLedOk = true;
-                #endif
             }
             break;
+        }
 
-        case SLEEP_TIMER_MOD_15:    // Enables/disables sleep after 15 minutes
+        case SLEEP_TIMER_MOD_15: {   // Enables/disables sleep after 15 minutes
             if (sleepTimerStartTimestamp && sleepTimer == 15) {
                 sleepTimerStartTimestamp = 0;
                 #ifdef NEOPIXEL_ENABLE
@@ -2805,8 +2840,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 showLedOk = true;
             #endif
             break;
+        }
 
-        case SLEEP_TIMER_MOD_30:    // Enables/disables sleep after 30 minutes
+        case SLEEP_TIMER_MOD_30: {   // Enables/disables sleep after 30 minutes
             if (sleepTimerStartTimestamp && sleepTimer == 30) {
                 sleepTimerStartTimestamp = 0;
                 #ifdef NEOPIXEL_ENABLE
@@ -2838,8 +2874,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 showLedOk = true;
             #endif
             break;
+        }
 
-        case SLEEP_TIMER_MOD_60:    // Enables/disables sleep after 60 minutes
+        case SLEEP_TIMER_MOD_60: {   // Enables/disables sleep after 60 minutes
             if (sleepTimerStartTimestamp && sleepTimer == 60) {
                 sleepTimerStartTimestamp = 0;
                 #ifdef NEOPIXEL_ENABLE
@@ -2871,8 +2908,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 showLedOk = true;
             #endif
             break;
+        }
 
-        case SLEEP_TIMER_MOD_120:    // Enables/disables sleep after 2 hrs
+        case SLEEP_TIMER_MOD_120: {   // Enables/disables sleep after 2 hrs
             if (sleepTimerStartTimestamp && sleepTimer == 120) {
                 sleepTimerStartTimestamp = 0;
                 #ifdef NEOPIXEL_ENABLE
@@ -2904,8 +2942,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 showLedOk = true;
             #endif
             break;
+        }
 
-        case SLEEP_AFTER_END_OF_TRACK:  // Puts uC to sleep after end of current track
+        case SLEEP_AFTER_END_OF_TRACK: { // Puts uC to sleep after end of current track
             if (playProperties.playMode == NO_PLAYLIST) {
                 loggerNl(serialDebug, (char *) FPSTR(modificatorNotallowedWhenIdle), LOGLEVEL_NOTICE);
                 #ifdef NEOPIXEL_ENABLE
@@ -2943,8 +2982,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 showLedOk = true;
             #endif
             break;
+        }
 
-        case SLEEP_AFTER_END_OF_PLAYLIST:   // Puts uC to sleep after end of whole playlist (can take a while :->)
+        case SLEEP_AFTER_END_OF_PLAYLIST: {  // Puts uC to sleep after end of whole playlist (can take a while :->)
             if (playProperties.playMode == NO_PLAYLIST) {
                 loggerNl(serialDebug, (char *) FPSTR(modificatorNotallowedWhenIdle), LOGLEVEL_NOTICE);
                 #ifdef NEOPIXEL_ENABLE
@@ -2982,8 +3022,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 showLedOk = true;
             #endif
             break;
+        }
 
-        case SLEEP_AFTER_5_TRACKS:
+        case SLEEP_AFTER_5_TRACKS:{
             if (playProperties.playMode == NO_PLAYLIST) {
                 loggerNl(serialDebug, (char *) FPSTR(modificatorNotallowedWhenIdle), LOGLEVEL_NOTICE);
                 #ifdef NEOPIXEL_ENABLE
@@ -3030,8 +3071,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 showLedOk = true;
             #endif
             break;
+        }
 
-        case REPEAT_PLAYLIST:
+        case REPEAT_PLAYLIST: {
             if (playProperties.playMode == NO_PLAYLIST) {
                 loggerNl(serialDebug, (char *) FPSTR(modificatorNotallowedWhenIdle), LOGLEVEL_NOTICE);
                 #ifdef NEOPIXEL_ENABLE
@@ -3054,8 +3096,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 #endif
             }
             break;
+        }
 
-        case REPEAT_TRACK:      // Introduces looping for track-mode
+        case REPEAT_TRACK: {     // Introduces looping for track-mode
             if (playProperties.playMode == NO_PLAYLIST) {
                 loggerNl(serialDebug, (char *) FPSTR(modificatorNotallowedWhenIdle), LOGLEVEL_NOTICE);
                 #ifdef NEOPIXEL_ENABLE
@@ -3078,8 +3121,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 #endif
             }
             break;
+        }
 
-        case DIMM_LEDS_NIGHTMODE:
+        case DIMM_LEDS_NIGHTMODE: {
             #ifdef MQTT_ENABLE
                 publishMqtt((char *) FPSTR(topicLedBrightnessState), ledBrightness, false);
             #endif
@@ -3089,8 +3133,9 @@ void doRfidCardModifications(const uint32_t mod) {
                 showLedOk = true;
             #endif
             break;
+        }
 
-        case TOGGLE_WIFI_STATUS:
+        case TOGGLE_WIFI_STATUS: {
             if (writeWifiStatusToNVS(!getWifiEnableStatusFromNVS())) {
                 #ifdef NEOPIXEL_ENABLE
                     showLedOk = true;
@@ -3100,15 +3145,125 @@ void doRfidCardModifications(const uint32_t mod) {
                     showLedError = true;
                 #endif
             }
-
             break;
-
-        default:
+        }
+        #ifdef BLUETOOTH_ENABLE
+            case TOGGLE_BLUETOOTH_MODE: {
+                if (readOperationModeFromNVS() == OPMODE_NORMAL) {
+                    #ifdef NEOPIXEL_ENABLE
+                        showLedOk = true;
+                    #endif
+                    setOperationMode(OPMODE_BLUETOOTH);
+                } else if (readOperationModeFromNVS() == OPMODE_BLUETOOTH) {
+                    #ifdef NEOPIXEL_ENABLE
+                        showLedOk = true;
+                    #endif
+                    setOperationMode(OPMODE_NORMAL);
+                } else {
+                    #ifdef NEOPIXEL_ENABLE
+                        showLedError = true;
+                    #endif
+                }
+                break;
+            }
+        #endif
+        #ifdef FTP_ENABLE
+            case ENABLE_FTP_SERVER: {
+                    if (wifiManager() == WL_CONNECTED && !ftpEnableLastStatus && !ftpEnableCurrentStatus) {
+                        ftpEnableLastStatus = true;
+                        #ifdef NEOPIXEL_ENABLE
+                            showLedOk = true;
+                        #endif
+                    } else {
+                        #ifdef NEOPIXEL_ENABLE
+                            showLedError = true;
+                            loggerNl(serialDebug, (char *) FPSTR(unableToStartFtpServer), LOGLEVEL_ERROR);
+                        #endif
+                    }
+                break;
+            }
+        #endif
+        case CMD_PLAYPAUSE: {
+            trackControlToQueueSender(PAUSEPLAY);
+            break;
+        }
+        case CMD_PREVTRACK: {
+            trackControlToQueueSender(PREVIOUSTRACK);
+            break;
+        }
+        case CMD_NEXTTRACK: {
+            trackControlToQueueSender(NEXTTRACK);
+            break;
+        }
+        case CMD_FIRSTTRACK: {
+            trackControlToQueueSender(FIRSTTRACK);
+            break;
+        }
+        case CMD_LASTTRACK: {
+            trackControlToQueueSender(LASTTRACK);
+            break;
+        }
+        case CMD_VOLUMEINIT: {
+            volumeToQueueSender(initVolume, true);
+            break;
+        }
+        case CMD_VOLUMEUP: {
+            volumeToQueueSender(currentVolume+1, true);
+            break;
+        }
+        case CMD_VOLUMEDOWN: {
+            volumeToQueueSender(currentVolume-1, true);
+            break;
+        }
+        case CMD_MEASUREBATTERY: {
+            #ifdef MEASURE_BATTERY_VOLTAGE
+                float voltage = measureBatteryVoltage();
+                snprintf(logBuf, serialLoglength, "%s: %.2f V", (char *) FPSTR(currentVoltageMsg), voltage);
+                loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
+                #ifdef NEOPIXEL_ENABLE
+                    showLedVoltage = true;
+                #endif
+                #ifdef MQTT_ENABLE
+                    char vstr[6];
+                    snprintf(vstr, 6, "%.2f", voltage);
+                    publishMqtt((char *) FPSTR(topicBatteryVoltage), vstr, false);
+                #endif
+            #endif
+            break;
+        }
+        case CMD_SLEEPMODE: {
+            gotoSleep = true;
+            break;
+        }
+        case CMD_SEEK_FORWARDS: {
+            Serial.println(F("Seek forwards")); // todo
+            if (playProperties.currentSeekmode == SEEK_FORWARDS) {
+                playProperties.currentSeekmode = SEEK_NORMAL;
+            } else {
+                playProperties.currentSeekmode = SEEK_FORWARDS;
+            }
+            Serial.println(playProperties.currentSeekmode);
+            Serial.println(playProperties.lastSeekmode);
+            break;
+        }
+        case CMD_SEEK_BACKWARDS: {
+            Serial.println(F("Seek backwards")); // todo
+            if (playProperties.currentSeekmode == SEEK_BACKWARDS) {
+                playProperties.currentSeekmode = SEEK_NORMAL;
+            } else {
+                playProperties.currentSeekmode = SEEK_BACKWARDS;
+            }
+            Serial.println(playProperties.currentSeekmode);
+            Serial.println(playProperties.lastSeekmode);
+            break;
+        }
+        default: {
             snprintf(logBuf, serialLoglength, "%s %d !", (char *) FPSTR(modificatorDoesNotExist), mod);
             loggerNl(serialDebug, logBuf, LOGLEVEL_ERROR);
             #ifdef NEOPIXEL_ENABLE
                 showLedError = true;
             #endif
+        }
     }
 }
 
@@ -3171,6 +3326,14 @@ void rfidPreferenceLookupHandler (void) {
                 #ifdef MQTT_ENABLE
                     publishMqtt((char *) FPSTR(topicRfidState), currentRfidTagId, false);
                 #endif
+
+                #ifdef BLUETOOTH_ENABLE
+                // if music rfid was read, go back to normal mode
+                if(operationMode == OPMODE_BLUETOOTH) {
+                    setOperationMode(OPMODE_NORMAL);
+                }
+                #endif
+
                 trackQueueDispatcher(_file, _lastPlayPos, _playMode, _trackLastPlayed);
             }
         }
@@ -3207,12 +3370,21 @@ void accessPointStart(const char *SSID, IPAddress ip, IPAddress netmask) {
 
     wServer.on("/restart", HTTP_GET, [] (AsyncWebServerRequest *request) {
         #if (LANGUAGE == 1)
-            request->send(200, "text/html", "ESP wird neu gestartet...");
+            request->send(200, "text/html", "ESPuino wird neu gestartet...");
         #else
-            request->send(200, "text/html", "ESP is being restarted...");
+            request->send(200, "text/html", "ESPuino is being restarted...");
         #endif
         Serial.flush();
         ESP.restart();
+    });
+
+    wServer.on("/shutdown", HTTP_GET, [] (AsyncWebServerRequest *request) {
+        #if (LANGUAGE == 1)
+            request->send(200, "text/html", "ESPuino wird ausgeschaltet...");
+        #else
+            request->send(200, "text/html", "ESPuino is being shutdown...");
+        #endif
+        gotoSleep = true;
     });
 
     // allow cors for local debug
@@ -3256,6 +3428,20 @@ bool writeWifiStatusToNVS(bool wifiStatus) {
             wifiNeedsRestart = true;
             wifiEnabled = true;
             return true;
+        }
+    }
+    return true;
+}
+
+uint8_t readOperationModeFromNVS(void) {
+    return prefsSettings.getUChar("operationMode", OPMODE_NORMAL);
+}
+
+bool setOperationMode(uint8_t newOperationMode) {
+    uint8_t currentOperationMode = prefsSettings.getUChar("operationMode", OPMODE_NORMAL);
+    if(currentOperationMode != newOperationMode) {
+        if (prefsSettings.putUChar("operationMode", newOperationMode)) {
+            ESP.restart();
         }
     }
     return true;
@@ -3363,6 +3549,8 @@ wl_status_t wifiManager(void) {
     return WiFi.status();
 }
 
+const char mqttTab[] PROGMEM = "<a class=\"nav-item nav-link\" id=\"nav-mqtt-tab\" data-toggle=\"tab\" href=\"#nav-mqtt\" role=\"tab\" aria-controls=\"nav-mqtt\" aria-selected=\"false\"><i class=\"fas fa-network-wired\"></i> MQTT</a>";
+const char ftpTab[] PROGMEM = "<a class=\"nav-item nav-link\" id=\"nav-ftp-tab\" data-toggle=\"tab\" href=\"#nav-ftp\" role=\"tab\" aria-controls=\"nav-ftp\" aria-selected=\"false\"><i class=\"fas fa-folder\"></i> FTP</a>";
 
 // Used for substitution of some variables/templates of html-files. Is called by webserver's template-engine
 String templateProcessor(const String& templ) {
@@ -3374,6 +3562,12 @@ String templateProcessor(const String& templ) {
         return String(ftpUserLength-1);
     } else if (templ == "FTP_PWD_LENGTH") {
         return String(ftpPasswordLength-1);
+    } else if (templ == "SHOW_FTP_TAB") {         // Only show FTP-tab if FTP-support was compiled
+        #ifdef FTP_ENABLE
+            return (String) FPSTR(ftpTab);
+        #else
+            return String();
+        #endif
     } else if (templ == "INIT_LED_BRIGHTNESS") {
         return String(prefsSettings.getUChar("iLedBrightness", 0));
     } else if (templ == "NIGHT_LED_BRIGHTNESS") {
@@ -3382,6 +3576,8 @@ String templateProcessor(const String& templ) {
         return String(prefsSettings.getUInt("mInactiviyT", 0));
     } else if (templ == "INIT_VOLUME") {
         return String(prefsSettings.getUInt("initVolume", 0));
+    } else if (templ == "CURRENT_VOLUME") {
+        return String(currentVolume);
     } else if (templ == "MAX_VOLUME_SPEAKER") {
         return String(prefsSettings.getUInt("maxVolumeSp", 0));
     } else if (templ == "MAX_VOLUME_HEADPHONE") {
@@ -3396,6 +3592,12 @@ String templateProcessor(const String& templ) {
         return String(prefsSettings.getUInt("vCheckIntv", voltageCheckInterval));
     } else if (templ == "MQTT_SERVER") {
         return prefsSettings.getString("mqttServer", "-1");
+    } else if (templ == "SHOW_MQTT_TAB") {        // Only show MQTT-tab if MQTT-support was compiled
+        #ifdef MQTT_ENABLE
+            return (String) FPSTR(mqttTab);
+        #else
+            return String();
+        #endif
     } else if (templ == "MQTT_ENABLE") {
         if (enableMqtt) {
             return String("checked=\"checked\"");
@@ -3412,6 +3614,8 @@ String templateProcessor(const String& templ) {
         return String(mqttPasswordLength-1);
     } else if (templ == "MQTT_SERVER_LENGTH") {
         return String(mqttServerLength-1);
+    } else if (templ == "MQTT_PORT") {
+        return String(mqttPort);
     } else if (templ == "IPv4") {
         myIP = WiFi.localIP();
         snprintf(logBuf, serialLoglength, "%d.%d.%d.%d", myIP[0], myIP[1], myIP[2], myIP[3]);
@@ -3499,13 +3703,14 @@ bool processJsonRequest(char *_serialJson) {
         prefsSettings.putString("mqttServer", (String) _mqttServer);
         const char *_mqttUser = doc["mqtt"]["mqttUser"];
         const char *_mqttPwd = doc["mqtt"]["mqttPwd"];
+        uint16_t _mqttPort = doc["mqtt"]["mqttPort"].as<uint16_t>();
 
-        prefsSettings.putUChar("enableMQTT", _mqttEnable);
         prefsSettings.putUChar("enableMQTT", _mqttEnable);
         prefsSettings.putString("mqttServer", (String) _mqttServer);
         prefsSettings.putString("mqttServer", (String) _mqttServer);
         prefsSettings.putString("mqttUser", (String) _mqttUser);
         prefsSettings.putString("mqttPassword", (String) _mqttPwd);
+        prefsSettings.putUInt("mqttPort", _mqttPort);
 
         if ((prefsSettings.getUChar("enableMQTT", 99) != _mqttEnable) ||
             (!String(_mqttServer).equals(prefsSettings.getString("mqttServer", "-1")))) {
@@ -3516,21 +3721,26 @@ bool processJsonRequest(char *_serialJson) {
         const char *_rfidIdModId = object["rfidMod"]["rfidIdMod"];
         uint8_t _modId = object["rfidMod"]["modId"];
         char rfidString[12];
-        snprintf(rfidString, sizeof(rfidString) / sizeof(rfidString[0]), "%s0%s0%s%u%s0", stringDelimiter, stringDelimiter, stringDelimiter, _modId, stringDelimiter);
-        prefsRfid.putString(_rfidIdModId, rfidString);
+        if(_modId<=0) {
+            prefsRfid.remove(_rfidIdModId);
+        } else {
+            snprintf(rfidString, sizeof(rfidString) / sizeof(rfidString[0]), "%s0%s0%s%u%s0", stringDelimiter, stringDelimiter, stringDelimiter, _modId, stringDelimiter);
+            prefsRfid.putString(_rfidIdModId, rfidString);
 
-        String s = prefsRfid.getString(_rfidIdModId, "-1");
-        if (s.compareTo(rfidString)) {
-            return false;
+            String s = prefsRfid.getString(_rfidIdModId, "-1");
+            if (s.compareTo(rfidString)) {
+                return false;
+            }
         }
         dumpNvsToSd("rfidTags", (char *) FPSTR(backupFile));        // Store backup-file every time when a new rfid-tag is programmed
 
     } else if (doc.containsKey("rfidAssign")) {
         const char *_rfidIdAssinId = object["rfidAssign"]["rfidIdMusic"];
-        const char *_fileOrUrl = object["rfidAssign"]["fileOrUrl"];
+        char _fileOrUrlAscii[MAX_FILEPATH_LENTGH];
+        convertUtf8ToAscii(object["rfidAssign"]["fileOrUrl"], _fileOrUrlAscii);
         uint8_t _playMode = object["rfidAssign"]["playMode"];
         char rfidString[275];
-        snprintf(rfidString, sizeof(rfidString) / sizeof(rfidString[0]), "%s%s%s0%s%u%s0", stringDelimiter, _fileOrUrl, stringDelimiter, stringDelimiter, _playMode, stringDelimiter);
+        snprintf(rfidString, sizeof(rfidString) / sizeof(rfidString[0]), "%s%s%s0%s%u%s0", stringDelimiter, _fileOrUrlAscii, stringDelimiter, stringDelimiter, _playMode, stringDelimiter);
         prefsRfid.putString(_rfidIdAssinId, rfidString);
         Serial.println(_rfidIdAssinId);
         Serial.println(rfidString);
@@ -3560,26 +3770,28 @@ bool processJsonRequest(char *_serialJson) {
     } else if (doc.containsKey("ping")) {
         sendWebsocketData(0, 20);
         return false;
-    } else if (doc.containsKey("refreshFileList")) {
-
-        //TODO: we need a semaphore or mutex here to prevent
-        //      a call when the task is still running
-        xTaskCreate(
-                fileHandlingTask,          /* Task function. */
-                "TaskTwo",        /* String with name of task. */
-                10000,            /* Stack size in bytes. */
-                NULL,             /* Parameter passed as input of the task */
-                1,                /* Priority of the task. */
-                NULL);            /* Task handle. */
-
+    } else if (doc.containsKey("controls")) {
+        if (object["controls"].containsKey("set_volume")) {
+            uint8_t new_vol = doc["controls"]["set_volume"].as<uint8_t>();
+            volumeToQueueSender(new_vol, true);
+        }
+        if (object["controls"].containsKey("action")) {
+            uint8_t cmd = doc["controls"]["action"].as<uint8_t>();
+            doCmdAction(cmd);
+        }
     }
 
     return true;
 }
 
-char *jBuf = (char *) calloc(255, sizeof(char));        // In heap to save static memory
 // Sends JSON-answers via websocket
 void sendWebsocketData(uint32_t client, uint8_t code) {
+    char *jBuf;
+    if (psramInit()) {
+    jBuf = (char *) ps_calloc(255, sizeof(char));
+    } else {
+    jBuf = (char *) calloc(255, sizeof(char));          // In heap to save static memory
+}
     const size_t CAPACITY = JSON_OBJECT_SIZE(1) + 20;
     StaticJsonDocument<CAPACITY> doc;
     JsonObject object = doc.to<JsonObject>();
@@ -3592,13 +3804,7 @@ void sendWebsocketData(uint32_t client, uint8_t code) {
         object["rfidId"] = currentRfidTagId;
     } else if (code == 20) {
         object["pong"] = "pong";
-    } else if (code == 30) {
-        object["refreshFileList"] = "ready";
-    } else if (code == 31) {
-        object["indexingState"] = fileNameBuf;
     }
-
-    //char jBuf[255];
 
     serializeJson(doc, jBuf, 255);
 
@@ -3607,6 +3813,7 @@ void sendWebsocketData(uint32_t client, uint8_t code) {
     } else {
         ws.printf(client, jBuf);
     }
+    free(jBuf);
 }
 
 
@@ -3679,7 +3886,7 @@ void setupVolume(void) {
             } else {
                 maxVolume = maxVolumeHeadphone;
                 if (currentVolume > maxVolume) {
-                    volumeToQueueSender(maxVolume);         // Lower volume for headphone if headphone's maxvolume is exceeded by volume set in speaker-mode
+                    volumeToQueueSender(maxVolume, true);         // Lower volume for headphone if headphone's maxvolume is exceeded by volume set in speaker-mode
                 }
             }
             headphoneLastDetectionState = currentHeadPhoneDetectionState;
@@ -3734,9 +3941,10 @@ void webserverStart(void) {
         ESP.restart();
     });
 
-    // Filebrowser (json-precached)
-    wServer.on("/files", HTTP_GET, [](AsyncWebServerRequest *request) {
-        request->send(FSystem, DIRECTORY_INDEX_FILE, "application/json");
+    // ESP-shutdown
+    wServer.on("/shutdown", HTTP_GET, [] (AsyncWebServerRequest *request) {
+        request->send_P(200, "text/html", shutdownWebsite);
+        gotoSleep = true;
     });
 
     // Fileexplorer (realtime)
@@ -3836,25 +4044,62 @@ void webserverStart(void) {
         return true;
     }
 
-// Conversion routine for http UTF-8 strings
-void convertUtf8ToAscii(String utf8String, char *asciiString) {
-    uint16_t i = 0, j=0;
-    bool f_C3_seen = false;
+// Conversion routine
+void convertAsciiToUtf8(String asciiString, char *utf8String) {
 
-    while(utf8String[i] != 0) {                                     // convert UTF8 to ASCII
-        if(utf8String[i] == 195){                                   // C3
-            i++;
-            f_C3_seen = true;
-            continue;
+    int k=0;
+
+    for (int i=0; i<asciiString.length() && k<MAX_FILEPATH_LENTGH-2; i++)
+    {
+
+        switch (asciiString[i]) {
+            case 0x8e: utf8String[k++]=0xc3; utf8String[k++]=0x84;  break; // Ä
+            case 0x84: utf8String[k++]=0xc3; utf8String[k++]=0xa4;  break; // ä
+            case 0x9a: utf8String[k++]=0xc3; utf8String[k++]=0x9c;  break; // Ü
+            case 0x81: utf8String[k++]=0xc3; utf8String[k++]=0xbc;  break; // ü
+            case 0x99: utf8String[k++]=0xc3; utf8String[k++]=0x96;  break; // Ö
+            case 0x94: utf8String[k++]=0xc3; utf8String[k++]=0xb6;  break; // ö
+            case 0xe1: utf8String[k++]=0xc3; utf8String[k++]=0x9f;  break; // ß
+            default: utf8String[k++]=asciiString[i];
         }
-        asciiString[j] = utf8String[i];
-        if(asciiString[j] > 128 && asciiString[j] < 189 && f_C3_seen == true) {
-            asciiString[j] = asciiString[j] + 64;                      // found a related ASCII sign
-            f_C3_seen = false;
-        }
-        i++; j++;
     }
-    asciiString[j] = 0;
+
+    utf8String[k]=0;
+
+}
+
+void convertUtf8ToAscii(String utf8String, char *asciiString) {
+
+  int k=0;
+  bool f_C3_seen = false;
+
+  for (int i=0; i<utf8String.length() && k<MAX_FILEPATH_LENTGH-1; i++)
+  {
+
+    if(utf8String[i] == 195){                                   // C3
+      f_C3_seen = true;
+      continue;
+    } else {
+      if (f_C3_seen == true) {
+        f_C3_seen = false;
+        switch (utf8String[i]) {
+          case 0x84: asciiString[k++]=0x8e;  break; // Ä
+          case 0xa4: asciiString[k++]=0x84;  break; // ä
+          case 0x9c: asciiString[k++]=0x9a;  break; // Ü
+          case 0xbc: asciiString[k++]=0x81;  break; // ü
+          case 0x96: asciiString[k++]=0x99;  break; // Ö
+          case 0xb6: asciiString[k++]=0x94;  break; // ö
+          case 0x9f: asciiString[k++]=0xe1;  break; // ß
+          default: asciiString[k++]=0xdb;  // Unknow...
+        }
+      } else {
+        asciiString[k++]=utf8String[i];
+      }
+
+    }
+  }
+
+  asciiString[k]=0;
 
 }
 
@@ -3867,7 +4112,7 @@ void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, s
     // New File
     if (!index) {
         String utf8FilePath;
-        static char asciiFilePath[256];
+        static char filePath[MAX_FILEPATH_LENTGH];
         if (request->hasParam("path")) {
             AsyncWebParameter *param = request->getParam("path");
             utf8FilePath = param->value() + "/" + filename;
@@ -3875,7 +4120,11 @@ void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, s
         } else {
             utf8FilePath = "/" + filename;
         }
-        convertUtf8ToAscii(utf8FilePath, asciiFilePath);
+
+        convertUtf8ToAscii(utf8FilePath, filePath);
+
+        snprintf(logBuf, serialLoglength, "%s: %s", (char *) FPSTR(writingFile), utf8FilePath.c_str());
+        loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
 
         // Create Ringbuffer for upload
         if(explorerFileUploadRingBuffer == NULL) {
@@ -3892,7 +4141,7 @@ void explorerHandleFileUpload(AsyncWebServerRequest *request, String filename, s
             explorerHandleFileStorageTask, /* Function to implement the task */
             "fileStorageTask", /* Name of the task */
             4000,  /* Stack size in words */
-            asciiFilePath,  /* Task input parameter */
+            filePath,  /* Task input parameter */
             2 | portPRIVILEGE_BIT,  /* Priority of the task */
             &fileStorageTaskHandle  /* Task handle. */
         );
@@ -3928,9 +4177,6 @@ void explorerHandleFileStorageTask(void *parameter) {
 
     uploadFile = FSystem.open((char *)parameter, "w");
 
-    snprintf(logBuf, serialLoglength, "%s: %s", (char *) FPSTR(writingFile), (char *) parameter);
-    loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
-
     for(;;) {
         esp_task_wdt_reset();
 
@@ -3957,17 +4203,17 @@ void explorerHandleFileStorageTask(void *parameter) {
 // Sends a list of the content of a directory as JSON file
 // requires a GET parameter path for the directory
 void explorerHandleListRequest(AsyncWebServerRequest *request) {
-    DynamicJsonDocument jsonBuffer(8192);
+    DynamicJsonDocument jsonBuffer(16384);
     //StaticJsonDocument<4096> jsonBuffer;
     String serializedJsonString;
     AsyncWebParameter *param;
-    char asciiFilePath[256];
+    char filePath[MAX_FILEPATH_LENTGH];
     JsonArray obj = jsonBuffer.createNestedArray();
     File root;
-    if(request->hasParam("path")){
+    if (request->hasParam("path")){
         param = request->getParam("path");
-        convertUtf8ToAscii(param->value(), asciiFilePath);
-        root = FSystem.open(asciiFilePath);
+        convertUtf8ToAscii(param->value(), filePath);
+        root = FSystem.open(filePath);
     } else {
         root = FSystem.open("/");
     }
@@ -3987,13 +4233,16 @@ void explorerHandleListRequest(AsyncWebServerRequest *request) {
     File file = root.openNextFile();
 
     while(file) {
-        JsonObject entry = obj.createNestedObject();
-        std::string path = file.name();
-        std::string fileName = path.substr(path.find_last_of("/") + 1);
+        // ignore hidden folders, e.g. MacOS spotlight files
+        if (!startsWith(file.name(),  (char *) "/.")) {
+            JsonObject entry = obj.createNestedObject();
+            convertAsciiToUtf8(file.name(), filePath);
+            std::string path = filePath;
+            std::string fileName = path.substr(path.find_last_of("/") + 1);
 
-        entry["name"] = fileName;
-        entry["dir"].set(file.isDirectory());
-
+            entry["name"] = fileName;
+            entry["dir"].set(file.isDirectory());
+        }
         file = root.openNextFile();
 
         esp_task_wdt_reset();
@@ -4001,42 +4250,59 @@ void explorerHandleListRequest(AsyncWebServerRequest *request) {
     }
 
     serializeJson(obj, serializedJsonString);
-    request->send(200, "application/json; charset=iso-8859-1", serializedJsonString);
+    request->send(200, "application/json; charset=utf-8", serializedJsonString);
+}
+
+bool explorerDeleteDirectory(File dir) {
+
+    File file = dir.openNextFile();
+    while(file) {
+
+        if(file.isDirectory()) {
+            explorerDeleteDirectory(file);
+        } else {
+            FSystem.remove(file.name());
+        }
+
+        file = dir.openNextFile();
+
+        esp_task_wdt_reset();
+    }
+
+    return FSystem.rmdir(dir.name());
+
 }
 
 // Handles delete request of a file or directory
 // requires a GET parameter path to the file or directory
 void explorerHandleDeleteRequest(AsyncWebServerRequest *request) {
     File file;
-    bool isDir;
     AsyncWebParameter *param;
-    char asciiFilePath[256];
+    char filePath[MAX_FILEPATH_LENTGH];
     if(request->hasParam("path")){
         param = request->getParam("path");
-        convertUtf8ToAscii(param->value(), asciiFilePath);
-        if(FSystem.exists(asciiFilePath)) {
-            file = FSystem.open(asciiFilePath);
-            isDir = file.isDirectory();
-            file.close();
-            if(isDir) {
-                if(FSystem.rmdir(asciiFilePath)) {
-                    snprintf(logBuf, serialLoglength, "DELETE:  %s deleted", asciiFilePath);
+        convertUtf8ToAscii(param->value(), filePath);
+        if(FSystem.exists(filePath)) {
+            file = FSystem.open(filePath);
+            if(file.isDirectory()) {
+                if(explorerDeleteDirectory(file)) {
+                    snprintf(logBuf, serialLoglength, "DELETE:  %s deleted", param->value().c_str());
                     loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
                 } else {
-                    snprintf(logBuf, serialLoglength, "DELETE:  Cannot delete %s", asciiFilePath);
+                    snprintf(logBuf, serialLoglength, "DELETE:  Cannot delete %s", param->value().c_str());
                     loggerNl(serialDebug, logBuf, LOGLEVEL_ERROR);
                 }
             } else {
-                if(FSystem.remove(asciiFilePath)) {
-                    snprintf(logBuf, serialLoglength, "DELETE:  %s deleted", asciiFilePath);
+                if(FSystem.remove(filePath)) {
+                    snprintf(logBuf, serialLoglength, "DELETE:  %s deleted", param->value().c_str());
                     loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
                 } else {
-                    snprintf(logBuf, serialLoglength, "DELETE:  Cannot delete %s", asciiFilePath);
+                    snprintf(logBuf, serialLoglength, "DELETE:  Cannot delete %s", param->value().c_str());
                     loggerNl(serialDebug, logBuf, LOGLEVEL_ERROR);
                 }
             }
         } else {
-            snprintf(logBuf, serialLoglength, "DELETE: Path %s does not exist", asciiFilePath);
+            snprintf(logBuf, serialLoglength, "DELETE: Path %s does not exist", param->value().c_str());
             loggerNl(serialDebug, logBuf, LOGLEVEL_ERROR);
         }
     } else {
@@ -4050,15 +4316,15 @@ void explorerHandleDeleteRequest(AsyncWebServerRequest *request) {
 // requires a GET parameter path to the new directory
 void explorerHandleCreateRequest(AsyncWebServerRequest *request) {
     AsyncWebParameter *param;
-    char asciiFilePath[256];
+    char filePath[MAX_FILEPATH_LENTGH];
     if(request->hasParam("path")){
         param = request->getParam("path");
-        convertUtf8ToAscii(param->value(), asciiFilePath);
-        if(FSystem.mkdir(asciiFilePath)) {
-            snprintf(logBuf, serialLoglength, "CREATE:  %s created", asciiFilePath);
+        convertUtf8ToAscii(param->value(), filePath);
+        if(FSystem.mkdir(filePath)) {
+            snprintf(logBuf, serialLoglength, "CREATE:  %s created", param->value().c_str());
             loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
         } else {
-            snprintf(logBuf, serialLoglength, "CREATE:  Cannot create %s", asciiFilePath);
+            snprintf(logBuf, serialLoglength, "CREATE:  Cannot create %s", param->value().c_str());
             loggerNl(serialDebug, logBuf, LOGLEVEL_ERROR);
         }
     } else {
@@ -4073,8 +4339,8 @@ void explorerHandleCreateRequest(AsyncWebServerRequest *request) {
 void explorerHandleRenameRequest(AsyncWebServerRequest *request) {
     AsyncWebParameter *srcPath;
     AsyncWebParameter *dstPath;
-    char srcFullFilePath[256];
-    char dstFullFilePath[256];
+    char srcFullFilePath[MAX_FILEPATH_LENTGH];
+    char dstFullFilePath[MAX_FILEPATH_LENTGH];
     if(request->hasParam("srcpath") && request->hasParam("dstpath")) {
         srcPath = request->getParam("srcpath");
         dstPath = request->getParam("dstpath");
@@ -4082,14 +4348,14 @@ void explorerHandleRenameRequest(AsyncWebServerRequest *request) {
         convertUtf8ToAscii(dstPath->value(), dstFullFilePath);
         if(FSystem.exists(srcFullFilePath)) {
             if(FSystem.rename(srcFullFilePath, dstFullFilePath)) {
-                    snprintf(logBuf, serialLoglength, "RENAME:  %s renamed to %s", srcFullFilePath, dstFullFilePath);
+                    snprintf(logBuf, serialLoglength, "RENAME:  %s renamed to %s", srcPath->value().c_str(), dstPath->value().c_str());
                     loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
             } else {
-                    snprintf(logBuf, serialLoglength, "RENAME:  Cannot rename %s", srcFullFilePath);
+                    snprintf(logBuf, serialLoglength, "RENAME:  Cannot rename %s", srcPath->value().c_str());
                     loggerNl(serialDebug, logBuf, LOGLEVEL_ERROR);
             }
         } else {
-            snprintf(logBuf, serialLoglength, "RENAME: Path %s does not exist", srcFullFilePath);
+            snprintf(logBuf, serialLoglength, "RENAME: Path %s does not exist", srcPath->value().c_str());
             loggerNl(serialDebug, logBuf, LOGLEVEL_ERROR);
         }
     } else {
@@ -4106,15 +4372,15 @@ void explorerHandleAudioRequest(AsyncWebServerRequest *request) {
     AsyncWebParameter *param;
     String playModeString;
     uint32_t playMode;
-    char asciiFilePath[256];
+    char filePath[MAX_FILEPATH_LENTGH];
     if(request->hasParam("path") && request->hasParam("playmode")) {
         param = request->getParam("path");
-        convertUtf8ToAscii(param->value(), asciiFilePath);
+        convertUtf8ToAscii(param->value(), filePath);
         param = request->getParam("playmode");
         playModeString = param->value();
 
         playMode = atoi(playModeString.c_str());
-        trackQueueDispatcher(asciiFilePath,0,playMode,0);
+        trackQueueDispatcher(filePath,0,playMode,0);
     } else {
         loggerNl(serialDebug, "AUDIO: No path variable set", LOGLEVEL_ERROR);
     }
@@ -4195,7 +4461,7 @@ void printWakeUpReason() {
             if (nfc14443.switchToLPCD(wakeupCounterInMs)) {
                 loggerNl(serialDebug, (char *) FPSTR(lowPowerCardSuccess), LOGLEVEL_INFO);
                 // configure wakeup pin for deep-sleep wake-up, use ext1
-                esp_sleep_enable_ext1_wakeup(BUTTON_PIN_BITMASK, ESP_EXT1_WAKEUP_ANY_HIGH);
+                esp_sleep_enable_ext1_wakeup((1ULL<<(RFID_IRQ)), ESP_EXT1_WAKEUP_ANY_HIGH);
                 // freeze pin states in deep sleep
                 gpio_hold_en(gpio_num_t(RFID_CS));  // CS/NSS
                 gpio_hold_en(gpio_num_t(RFID_RST)); // RST
@@ -4209,9 +4475,163 @@ void printWakeUpReason() {
     }
 #endif
 
+#ifdef IR_CONTROL_ENABLE
+    void handleIrReceiver() {
+        static uint8_t lastVolume = 0;
+
+        if (IrReceiver.decode()) {
+
+            // Print a short summary of received data
+            IrReceiver.printIRResultShort(&Serial);
+            Serial.println();
+            IrReceiver.resume(); // Enable receiving of the next value
+            bool rcActionOk = false;
+            if (millis() - lastRcCmdTimestamp >= IR_DEBOUNCE) {
+                rcActionOk = true; // not used for volume up/down
+                lastRcCmdTimestamp = millis();
+            }
+
+            switch (IrReceiver.decodedIRData.command) {
+                case RC_PLAY: {
+                    if (rcActionOk) {
+                        doCmdAction(CMD_PLAYPAUSE);
+                        Serial.println(F("RC: Play"));
+                    }
+                    break;
+                }
+                case RC_PAUSE: {
+                    if (rcActionOk) {
+                        doCmdAction(CMD_PLAYPAUSE);
+                        Serial.println(F("RC: Pause"));
+                    }
+                    break;
+                }
+                case RC_NEXT: {
+                    if (rcActionOk) {
+                        doCmdAction(CMD_NEXTTRACK);
+                        Serial.println(F("RC: Next"));
+                    }
+                    break;
+                }
+                case RC_PREVIOUS: {
+                    if (rcActionOk) {
+                        doCmdAction(CMD_PREVTRACK);
+                        Serial.println(F("RC: Previous"));
+                    }
+                    break;
+                }
+                case RC_FIRST: {
+                    if (rcActionOk) {
+                        doCmdAction(CMD_FIRSTTRACK);
+                        Serial.println(F("RC: First"));
+                    }
+                    break;
+                }
+                case RC_LAST: {
+                    if (rcActionOk) {
+                        doCmdAction(CMD_LASTTRACK);
+                        Serial.println(F("RC: Last"));
+                    }
+                    break;
+                }
+                case RC_MUTE: {
+                    if (rcActionOk) {
+                        if (currentVolume > 0) {
+                            lastVolume = currentVolume;
+                            currentVolume = 0;
+                        } else {
+                            currentVolume = lastVolume;     // Remember last volume if mute is pressed again
+                        }
+                        xQueueSend(volumeQueue, &currentVolume, 0);
+                        Serial.println(F("RC: Mute"));
+                    }
+                    break;
+                }
+                case RC_BLUETOOTH: {
+                    if (rcActionOk) {
+                        doCmdAction(TOGGLE_BLUETOOTH_MODE);
+                        Serial.println(F("RC: Bluetooth"));
+                    }
+                    break;
+                }
+               case RC_FTP: {
+                    if (rcActionOk) {
+                        doCmdAction(ENABLE_FTP_SERVER);
+                        Serial.println(F("RC: FTP"));
+                    }
+                    break;
+                }
+                case RC_SHUTDOWN: {
+                    if (rcActionOk) {
+                        gotoSleep = true;
+                        Serial.println(F("RC: Shutdown"));
+                    }
+                    break;
+                }
+                case RC_VOL_DOWN: {
+                    doCmdAction(CMD_VOLUMEDOWN);
+                    Serial.println(F("RC: Volume down"));
+                    break;
+                }
+                case RC_VOL_UP: {
+                    doCmdAction(CMD_VOLUMEUP);
+                    Serial.println(F("RC: Volume up"));
+                    break;
+                }
+                default: {
+                    if (rcActionOk) {
+                        Serial.println(F("RC: unknown"));
+                    }
+                }
+            }
+        }
+    }
+#endif
+
 void setup() {
     Serial.begin(115200);
-    // esp_sleep_enable_ext0_wakeup((gpio_num_t) DREHENCODER_BUTTON, 0);
+    if (psramInit()) {
+        logBuf = (char*) ps_calloc(serialLoglength, sizeof(char)); // Buffer for all log-messages
+    } else {
+        logBuf = (char*) calloc(serialLoglength, sizeof(char)); // Buffer for all log-messages
+    }
+    #if (WAKEUP_BUTTON <= 39)
+        esp_sleep_enable_ext0_wakeup((gpio_num_t) WAKEUP_BUTTON, 0);
+    #endif
+
+    #ifdef NEOPIXEL_ENABLE      // Try to find button that is used for shutdown via longpress-action (only necessary for Neopixel)
+        #ifdef BUTTON_0_ENABLE
+            #if (BUTTON_0_LONG == CMD_SLEEPMODE)
+                shutdownButton = 0;
+            #endif
+        #endif
+        #ifdef BUTTON_1_ENABLE
+            #if (BUTTON_1_LONG == CMD_SLEEPMODE)
+                shutdownButton = 1;
+            #endif
+        #endif
+        #ifdef BUTTON_2_ENABLE
+            #if (BUTTON_2_LONG == CMD_SLEEPMODE)
+                shutdownButton = 2;
+            #endif
+        #endif
+        #ifdef BUTTON_3_ENABLE
+            #if (BUTTON_3_LONG == CMD_SLEEPMODE)
+                shutdownButton = 3;
+            #endif
+        #endif
+        #ifdef BUTTON_4_ENABLE
+            #if (BUTTON_4_LONG == CMD_SLEEPMODE)
+                shutdownButton = 4;
+            #endif
+        #endif
+        #ifdef BUTTON_5_ENABLE
+            #if (BUTTON_5_LONG == CMD_SLEEPMODE)
+                shutdownButton = 5;
+            #endif
+        #endif
+    #endif
+
     #ifdef PN5180_ENABLE_LPCD
         // disable pin hold from deep sleep (LPCD)
         gpio_deep_sleep_hold_dis();
@@ -4245,6 +4665,8 @@ void setup() {
     playProperties.pausePlay = false;
     playProperties.trackFinished = NULL;
     playProperties.playlistFinished = true;
+    playProperties.currentSeekmode = SEEK_NORMAL;
+    playProperties.lastSeekmode = SEEK_NORMAL;
 
     // Examples for serialized RFID-actions that are stored in NVS
     // #<file/folder>#<startPlayPositionInBytes>#<playmode>#<trackNumberToStartWith>
@@ -4285,11 +4707,7 @@ void setup() {
 #endif
 
     #ifdef RFID_READER_TYPE_MFRC522_SPI
-        #if (HAL == 4)
-            SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_CS);     // ToDo: Not sure if this should be the default-case
-        #else
-            SPI.begin();
-        #endif
+        SPI.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_CS);
         SPI.setFrequency(1000000);
     #endif
 
@@ -4330,7 +4748,7 @@ void setup() {
 
     #ifdef RFID_READER_TYPE_MFRC522_SPI
         mfrc522.PCD_Init();
-        mfrc522.PCD_SetAntennaGain(mfrc522.RxGain_max);
+        mfrc522.PCD_SetAntennaGain(rfidGain);
         delay(50);
         loggerNl(serialDebug, (char *) FPSTR(rfidScannerReady), LOGLEVEL_DEBUG);
         mfrc522.PCD_DumpVersionToSerial();	// Show details of PCD - MFRC522 Card Reader details
@@ -4338,12 +4756,12 @@ void setup() {
 
    // welcome message
    Serial.println(F(""));
-   Serial.println(F(" _____         _____ _____ _____ _____     "));
-   Serial.println(F("|_   _|___ ___|  |  |     |   | |     |   "));
-   Serial.println(F("  | | | . |   |  |  |-   -| | | |  |  |   "));
-   Serial.println(F("  |_| |___|_|_|_____|_____|_|___|_____|   "));
-   Serial.println(F("  ESP32-version"));
-   Serial.println(F(""));
+   Serial.println(F("  _____   ____    ____            _                 "));
+   Serial.println(F(" | ____| / ___|  |  _ \\   _   _  (_)  _ __     ___  "));
+   Serial.println(F(" |  _|   \\__  \\  | |_) | | | | | | | | '_ \\   / _ \\"));
+   Serial.println(F(" | |___   ___) | |  __/  | |_| | | | | | | | | (_) |"));
+   Serial.println(F(" |_____| |____/  |_|      \\__,_| |_| |_| |_|  \\___/ "));
+   Serial.println(F(" Rfid-controlled musicplayer\n"));
    // print wake-up reason
    printWakeUpReason();
    #ifdef PN5180_ENABLE_LPCD
@@ -4374,17 +4792,6 @@ void setup() {
     #ifdef HEADPHONE_ADJUST_ENABLE
         pinMode(HP_DETECT, INPUT);
         headphoneLastDetectionState = digitalRead(HP_DETECT);
-    #endif
-
-    #ifdef BLUETOOTH_ENABLE
-        i2s_pin_config_t pin_config = {
-            .bck_io_num = I2S_BCLK,
-            .ws_io_num = I2S_LRC,
-            .data_out_num = I2S_DOUT,
-            .data_in_num = I2S_PIN_NO_CHANGE
-        };
-        a2dp_sink.set_pin_config(pin_config);
-        a2dp_sink.start("Tonuino");
     #endif
 
     // Create queues
@@ -4569,6 +4976,16 @@ void setup() {
         loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
     }
 
+    // Get MQTT-password from NVS
+    uint32_t nvsMqttPort = prefsSettings.getUInt("mqttPort", 99999);
+    if (nvsMqttPort == 99999) {
+       prefsSettings.putUInt("mqttPort", mqttPort);
+    } else {
+         mqttPort = nvsMqttPort;
+         snprintf(logBuf, serialLoglength, "%s: %u", (char *) FPSTR(restoredMqttPortFromNvs), mqttPort);
+         loggerNl(serialDebug, logBuf, LOGLEVEL_INFO);
+    }
+
     #ifdef MEASURE_BATTERY_VOLTAGE
         // Get voltages from NVS for Neopixel
         float vLowIndicator = prefsSettings.getFloat("vIndicatorLow", 999.99);
@@ -4626,51 +5043,79 @@ void setup() {
         0 /* Core where the task should run */
     );
 
-    xTaskCreatePinnedToCore(
-        playAudio, /* Function to implement the task */
-        "mp3play", /* Name of the task */
-        11000,  /* Stack size in words */
-        NULL,  /* Task input parameter */
-        2 | portPRIVILEGE_BIT,  /* Priority of the task */
-        &mp3Play,  /* Task handle. */
-        1 /* Core where the task should run */
-    );
-
-
-
-
-    // Activate internal pullups for all buttons
-    // pinMode(DREHENCODER_BUTTON, INPUT_PULLUP);
-    pinMode(PAUSEPLAY_BUTTON, INPUT_PULLUP);
-    pinMode(NEXT_BUTTON, INPUT_PULLUP);
-    pinMode(PREVIOUS_BUTTON, INPUT_PULLUP);
+    // Activate internal pullups for all enabled buttons
+    #ifdef BUTTON_0_ENABLE
+        pinMode(NEXT_BUTTON, INPUT_PULLUP);
+    #endif
+    #ifdef BUTTON_1_ENABLE
+        pinMode(PREVIOUS_BUTTON, INPUT_PULLUP);
+    #endif
+    #ifdef BUTTON_2_ENABLE
+        pinMode(PAUSEPLAY_BUTTON, INPUT_PULLUP);
+    #endif
+    #ifdef BUTTON_3_ENABLE
+        pinMode(DREHENCODER_BUTTON, INPUT_PULLUP);
+    #endif
+    #ifdef BUTTON_4_ENABLE
+        pinMode(BUTTON_4, INPUT_PULLUP);
+    #endif
+    #ifdef BUTTON_5_ENABLE
+        pinMode(BUTTON_5, INPUT_PULLUP);
+    #endif
+    unsigned long currentTimestamp = millis();
 
     // Init rotary encoder
-    // encoder.attachHalfQuad(DREHENCODER_CLK, DREHENCODER_DT);
-    // encoder.clearCount();
-    // encoder.setCount(initVolume*2);         // Ganzes Raster ist immer +2, daher initiale Lautstärke mit 2 multiplizieren
-
-    // Init potentiomenter
-
+    #ifdef USEROTARY_ENABLE
+        encoder.attachHalfQuad(DREHENCODER_CLK, DREHENCODER_DT);
+        encoder.clearCount();
+        encoder.setCount(initVolume*2);         // Ganzes Raster ist immer +2, daher initiale Lautstärke mit 2 multiplizieren
+    #endif
 
     // Only enable MQTT if requested
     #ifdef MQTT_ENABLE
         if (enableMqtt) {
-            MQTTclient.setServer(mqtt_server, 1883);
+            MQTTclient.setServer(mqtt_server, mqttPort);
             MQTTclient.setCallback(callback);
         }
     #endif
 
+    operationMode = readOperationModeFromNVS();
     wifiEnabled = getWifiEnableStatusFromNVS();
-    wifiManager();
+
+    #ifdef BLUETOOTH_ENABLE
+    if (operationMode == OPMODE_BLUETOOTH) {
+        a2dp_sink = new BluetoothA2DPSink();
+        i2s_pin_config_t pin_config = {
+            .bck_io_num = I2S_BCLK,
+            .ws_io_num = I2S_LRC,
+            .data_out_num = I2S_DOUT,
+            .data_in_num = I2S_PIN_NO_CHANGE
+        };
+        a2dp_sink->set_pin_config(pin_config);
+        a2dp_sink->start((char *) FPSTR(nameBluetoothDevice));
+    } else {
+        esp_bt_mem_release(ESP_BT_MODE_BTDM);
+    #endif
+        xTaskCreatePinnedToCore(
+            playAudio, /* Function to implement the task */
+            "mp3play", /* Name of the task */
+            11000,  /* Stack size in words */
+            NULL,  /* Task input parameter */
+            2 | portPRIVILEGE_BIT,  /* Priority of the task */
+            &mp3Play,  /* Task handle. */
+            1 /* Core where the task should run */
+        );
+        wifiManager();
+    #ifdef BLUETOOTH_ENABLE
+    }
+    #endif
+
+    #ifdef IR_CONTROL_ENABLE
+        IrReceiver.begin(IRLED_PIN);
+    #endif
 
     lastTimeActiveTimestamp = millis();     // initial set after boot
 
-    // Create empty index json-file when no file exists.
-    if (!fileExists(FSystem,DIRECTORY_INDEX_FILE)) {
-        createFile(FSystem,DIRECTORY_INDEX_FILE,"[]");
-        esp_deep_sleep_start();
-    }
     bootComplete = true;
 
     snprintf(logBuf, serialLoglength, "%s: %u", (char *) FPSTR(freeHeapAfterSetup), ESP.getFreeHeap());
@@ -4678,49 +5123,75 @@ void setup() {
     Serial.printf("PSRAM: %u bytes\n", ESP.getPsramSize());
 }
 
+#ifdef BLUETOOTH_ENABLE
+void bluetoothHandler(void) {
+    esp_a2d_audio_state_t state = a2dp_sink->get_audio_state();
+    // Reset Sleep Timer when audio is playing
+    if(state == ESP_A2D_AUDIO_STATE_STARTED) {
+        lastTimeActiveTimestamp = millis();
+    }
+}
+#endif
 
 void loop() {
-    webserverStart();
-    #ifdef FTP_ENABLE
-        ftpManager();
+
+    #ifdef BLUETOOTH_ENABLE
+    if(operationMode == OPMODE_BLUETOOTH) {
+        bluetoothHandler();
+    } else {
     #endif
+        webserverStart();
+        #ifdef FTP_ENABLE
+            ftpManager();
+        #endif
+        #ifdef USEROTARY_ENABLE
+            rotaryVolumeHandler(minVolume, maxVolume);
+        #endif
+        if (wifiManager() == WL_CONNECTED) {
+            #ifdef MQTT_ENABLE
+                if (enableMqtt) {
+                    reconnect();
+                    MQTTclient.loop();
+                    postHeartbeatViaMqtt();
+                }
+            #endif
+            #ifdef FTP_ENABLE
+                if (ftpEnableLastStatus && ftpEnableCurrentStatus) {
+                    ftpSrv->handleFTP();
+                }
+            #endif
+        }
+        #ifdef FTP_ENABLE
+            if (ftpEnableLastStatus && ftpEnableCurrentStatus) {
+                if (ftpSrv->isConnected()) {
+                    lastTimeActiveTimestamp = millis();     // Re-adjust timer while client is connected to avoid ESP falling asleep
+                }
+            }
+        #endif
+        ws.cleanupClients();
+    #ifdef BLUETOOTH_ENABLE
+    }
+    #endif
+
+
     #ifdef HEADPHONE_ADJUST_ENABLE
         headphoneVolumeManager();
     #endif
     #ifdef MEASURE_BATTERY_VOLTAGE
         batteryVoltageTester();
     #endif
-    volumeHandler(minVolume, maxVolume);
     buttonHandler();
     doButtonActions();
     sleepHandler();
     deepSleepManager();
     rfidPreferenceLookupHandler();
-    if (wifiManager() == WL_CONNECTED) {
-        #ifdef MQTT_ENABLE
-            if (enableMqtt) {
-                reconnect();
-                MQTTclient.loop();
-                postHeartbeatViaMqtt();
-            }
-        #endif
-        #ifdef FTP_ENABLE
-            if (ftpEnableLastStatus && ftpEnableCurrentStatus) {
-                ftpSrv->handleFTP();
-            }
-        #endif
-    }
-    #ifdef FTP_ENABLE
-        if (ftpEnableLastStatus && ftpEnableCurrentStatus) {
-            if (ftpSrv->isConnected()) {
-                lastTimeActiveTimestamp = millis();     // Re-adjust timer while client is connected to avoid ESP falling asleep
-            }
-        }
-    #endif
+
     #ifdef PLAY_LAST_RFID_AFTER_REBOOT
         recoverLastRfidPlayed();
     #endif
-    ws.cleanupClients();
+    #ifdef IR_CONTROL_ENABLE
+        handleIrReceiver();
+    #endif
 }
 
 
