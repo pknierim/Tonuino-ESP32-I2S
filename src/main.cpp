@@ -2500,7 +2500,7 @@ void trackControlToQueueSender(const uint8_t trackCommand) {
 
 
 // Handles volume directed by rotary encoder
-void volumeHandler(const int32_t _minVolume, const int32_t _maxVolume) {
+void potentiometerVolumeHandler(const int32_t _minVolume, const int32_t _maxVolume) {
     
 
   float RawTemperature = analogRead(A6);
@@ -2535,10 +2535,10 @@ void volumeHandler(const int32_t _minVolume, const int32_t _maxVolume) {
     
     currentVolume = potVolume;
     if (currentVolume != lastVolume) {  
-        snprintf(logBuf, serialLoglength, "pot: %d, last: %d, current: %d", potVolume, lastVolume, currentVolume);
+        //snprintf(logBuf, serialLoglength, "pot: %d, last: %d, current: %d", potVolume, lastVolume, currentVolume);
         loggerNl(serialDebug, logBuf, LOGLEVEL_NOTICE);
         lastVolume = currentVolume;
-        volumeToQueueSender(currentVolume);
+        volumeToQueueSender(currentVolume,false);
     }
 
     /**
@@ -3456,7 +3456,8 @@ bool setOperationMode(uint8_t newOperationMode) {
             loggerNl(serialDebug, logBuf, LOGLEVEL_DEBUG);
             ftpEnableCurrentStatus = true;
             ftpSrv = new FtpServer();
-            ftpSrv->begin(FSystem, ftpUser, ftpPassword);
+            ftpSrv->begin(ftpUser,ftpPassword);
+            //ftpSrv->begin(FSystem, ftpUser, ftpPassword);
             snprintf(logBuf, serialLoglength, "%s: %u", (char *) FPSTR(freeHeapWithFtp), ESP.getFreeHeap());
             loggerNl(serialDebug, logBuf, LOGLEVEL_DEBUG);
             #if (LANGUAGE == 1)
@@ -5146,6 +5147,9 @@ void loop() {
         #endif
         #ifdef USEROTARY_ENABLE
             rotaryVolumeHandler(minVolume, maxVolume);
+        #endif
+        #ifdef USERPOTENTIOMETER_ENABLE
+            potentiometerVolumeHandler(minVolume, maxVolume);
         #endif
         if (wifiManager() == WL_CONNECTED) {
             #ifdef MQTT_ENABLE

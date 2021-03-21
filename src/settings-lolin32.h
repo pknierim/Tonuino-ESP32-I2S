@@ -52,6 +52,8 @@
 // Potentiometer 
 #ifdef USERPOTENTIOMETER_ENABLE
     #define POTENTIOMETER                   34
+    #define DREHENCODER_BUTTON              32      // Button 3: is used to switch ESPuino on and off
+
 #endif
 
 // Rotary encoder
