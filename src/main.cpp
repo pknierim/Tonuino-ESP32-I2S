@@ -1771,6 +1771,12 @@ void playAudio(void *parameter) {
 
 
 #if defined RFID_READER_TYPE_MFRC522_SPI || defined RFID_READER_TYPE_MFRC522_I2C
+
+bool rfid_tag_present_prev = false;
+bool rfid_tag_present = false;
+int _rfid_error_counter = 0;
+bool _tag_found = false;
+
 // Instructs RFID-scanner to scan for new RFID-tags
 void rfidScanner(void *parameter) {
     byte cardId[cardIdSize];
@@ -1784,55 +1790,97 @@ void rfidScanner(void *parameter) {
             // Reset the loop if no new card is present on the sensor/reader. This saves the entire process when idle.
 
 
-            if (!mfrc522.PICC_IsNewCardPresent()) {
+            //-----
+
+            rfid_tag_present_prev = rfid_tag_present;
+
+            _rfid_error_counter += 1;
+            if(_rfid_error_counter > 2){
+                _tag_found = false;
+            }
+
+            // Detect Tag without looking for collisions
+            byte bufferATQA[2];
+            byte bufferSize = sizeof(bufferATQA);
+
+            // Reset baud rates
+            mfrc522.PCD_WriteRegister(mfrc522.TxModeReg, 0x00);
+            mfrc522.PCD_WriteRegister(mfrc522.RxModeReg, 0x00);
+            // Reset ModWidthReg
+            mfrc522.PCD_WriteRegister(mfrc522.ModWidthReg, 0x26);
+
+            MFRC522::StatusCode result = mfrc522.PICC_RequestA(bufferATQA, &bufferSize);
+
+            if(result == mfrc522.STATUS_OK){
+                if ( ! mfrc522.PICC_ReadCardSerial()) { //Since a PICC placed get Serial and continue   
                 continue;
-            }
-            else{
-                logger(serialDebug, "!!!NEUE KARTE!!!\n", LOGLEVEL_ERROR);
-            }
-
-            // Select one of the cards
-            if (!mfrc522.PICC_ReadCardSerial()) {
-                continue;
-            }
-
-            
-            //mfrc522.PICC_DumpToSerial(&(mfrc522.uid));
-            
-            mfrc522.PICC_HaltA();
-            mfrc522.PCD_StopCrypto1();
-
-            if (psramInit()) {
-                cardIdString = (char *) ps_malloc(cardIdSize*3 +1);
-            } else {
-                cardIdString = (char *) malloc(cardIdSize*3 +1);
-            }
-
-            if (cardIdString == NULL) {
-                logger(serialDebug, (char *) FPSTR(unableToAllocateMem), LOGLEVEL_ERROR);
-                #ifdef NEOPIXEL_ENABLE
-                    showLedError = true;
-                #endif
-                continue;
-            }
-
-            uint8_t n = 0;
-            logger(serialDebug, (char *) FPSTR(rfidTagDetected), LOGLEVEL_NOTICE);
-            for (uint8_t i=0; i<cardIdSize; i++) {
-                cardId[i] = mfrc522.uid.uidByte[i];
-
-                snprintf(logBuf, serialLoglength, "%02x", cardId[i]);
-                logger(serialDebug, logBuf, LOGLEVEL_NOTICE);
-
-                n += snprintf (&cardIdString[n], sizeof(cardIdString) / sizeof(cardIdString[0]), "%03d", cardId[i]);
-                if (i<(cardIdSize-1)) {
-                    logger(serialDebug, "-", LOGLEVEL_NOTICE);
-                } else {
-                    logger(serialDebug, "\n", LOGLEVEL_NOTICE);
                 }
+                _rfid_error_counter = 0;
+                _tag_found = true;        
             }
-            xQueueSend(rfidCardQueue, &cardIdString, 0);
-//            free(cardIdString);
+            
+            rfid_tag_present = _tag_found;
+            
+
+            
+            // falling edge
+            if (!rfid_tag_present && rfid_tag_present_prev){
+                Serial.println("Tag gone");
+                trackControlToQueueSender(PAUSEPLAY);
+            }
+
+            // rising edge
+            if (rfid_tag_present && !rfid_tag_present_prev){
+                Serial.println("Tag found");
+            
+                //-----
+
+                /**
+                if (!mfrc522.PICC_IsNewCardPresent()) {
+                    continue;
+                }
+
+                // Select one of the cards
+                if (!mfrc522.PICC_ReadCardSerial()) {
+                    continue;
+                }
+                **/
+                            
+                //mfrc522.PICC_HaltA();
+                mfrc522.PCD_StopCrypto1();
+
+                if (psramInit()) {
+                    cardIdString = (char *) ps_malloc(cardIdSize*3 +1);
+                } else {
+                    cardIdString = (char *) malloc(cardIdSize*3 +1);
+                }
+
+                if (cardIdString == NULL) {
+                    logger(serialDebug, (char *) FPSTR(unableToAllocateMem), LOGLEVEL_ERROR);
+                    #ifdef NEOPIXEL_ENABLE
+                        showLedError = true;
+                    #endif
+                    continue;
+                }
+
+                uint8_t n = 0;
+                logger(serialDebug, (char *) FPSTR(rfidTagDetected), LOGLEVEL_NOTICE);
+                for (uint8_t i=0; i<cardIdSize; i++) {
+                    cardId[i] = mfrc522.uid.uidByte[i];
+
+                    snprintf(logBuf, serialLoglength, "%02x", cardId[i]);
+                    logger(serialDebug, logBuf, LOGLEVEL_NOTICE);
+
+                    n += snprintf (&cardIdString[n], sizeof(cardIdString) / sizeof(cardIdString[0]), "%03d", cardId[i]);
+                    if (i<(cardIdSize-1)) {
+                        logger(serialDebug, "-", LOGLEVEL_NOTICE);
+                    } else {
+                        logger(serialDebug, "\n", LOGLEVEL_NOTICE);
+                    }
+                }
+                xQueueSend(rfidCardQueue, &cardIdString, 0);
+    //            free(cardIdString);
+            }
         }
     }
     vTaskDelete(NULL);
