@@ -54,6 +54,10 @@
     #define DREHENCODER_BUTTON          32          // Button 3: is used to switch ESPuino on and off
 #endif
 
+#ifdef USEPOTENTIOMETER_ENABLE
+    #define POTENTIOMETER               34
+#endif
+
 // Control-buttons (set to 99 to disable)
 #define NEXT_BUTTON                      0          // Button 0: GPIO to detect next
 #define PREVIOUS_BUTTON                 36          // Button 1: GPIO to detect previous (Important: as of 19.11.2020 changed from 33 to 2; make sure to change in SD-MMC-mode)
@@ -63,7 +67,7 @@
 
 // Wake-up button
 // Please note: only RTC-GPIOs (0, 4, 12, 13, 14, 15, 25, 26, 27, 32, 33, 34, 35, 36, 39, 99) can be used! Set to 99 to disable.
-#define WAKEUP_BUTTON                   DREHENCODER_BUTTON // Defines the button that is used to wake up ESPuino from deepsleep.
+#define WAKEUP_BUTTON                   99 //DREHENCODER_BUTTON // Defines the button that is used to wake up ESPuino from deepsleep.
 
 // (optional) Power-control
 #define POWER                            4          // GPIO used to drive transistor-circuit, that switches off peripheral devices while ESP32-deepsleep
