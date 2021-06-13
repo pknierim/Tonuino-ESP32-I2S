@@ -41,7 +41,7 @@
 #ifdef SD_MMC_1BIT_MODE
     #include "SD_MMC.h"
 #else
-    #include "SD.h"
+    #include "SD.h" 
 #endif
 #include "esp_task_wdt.h"
 #ifdef RFID_READER_TYPE_MFRC522_SPI
@@ -1969,6 +1969,7 @@ void rfidScanner(void *parameter) {
             if (ISO15693_EC_OK == myrc) {
                 Serial.println(F("disabling privacy-mode successful"));
             }
+
             // try to read ISO15693 inventory
             ISO15693ErrorCode rc = nfc15693.getInventory(uid);
             if (rc == ISO15693_EC_OK) {
@@ -2550,91 +2551,31 @@ void trackControlToQueueSender(const uint8_t trackCommand) {
 // Handles volume directed by rotary encoder
 void potentiometerVolumeHandler(const int32_t _minVolume, const int32_t _maxVolume) {
     
-
-  float RawTemperature = analogRead(A6);
-
-  RunningAverageBuffer[NextRunningAverage++] = RawTemperature;
+  float RawVolume = analogRead(POTENTIOMETER);
+  RunningAverageBuffer[NextRunningAverage++] = RawVolume;
   if (NextRunningAverage >= RunningAverageCount)
   {
     NextRunningAverage = 0; 
   }
-  float RunningAverageTemperature = 0;
+  float RunningAverageVolume = 0;
   for(int i=0; i< RunningAverageCount; ++i)
   {
-    RunningAverageTemperature += RunningAverageBuffer[i];
+    RunningAverageVolume += RunningAverageBuffer[i];
   }
-  RunningAverageTemperature /= RunningAverageCount;
+  RunningAverageVolume /= RunningAverageCount;
 
-
-
-
-    potVolume = (RunningAverageTemperature - 300)/161.9f ; 
+    potVolume = (RunningAverageVolume - 300)/161.9f ; 
     if (potVolume<0)
         potVolume = 0;
     if (potVolume>21)   
         potVolume = 21;
-
-    //potVolume = potVolume / 4.7619f;
-
-    //snprintf(logBuf, serialLoglength, "volumeHandler: %d", potVolume);
-    //loggerNl(serialDebug, logBuf, LOGLEVEL_NOTICE);
-
-
     
     currentVolume = potVolume;
     if (currentVolume != lastVolume) {  
-        //snprintf(logBuf, serialLoglength, "pot: %d, last: %d, current: %d", potVolume, lastVolume, currentVolume);
         loggerNl(serialDebug, logBuf, LOGLEVEL_NOTICE);
         lastVolume = currentVolume;
         volumeToQueueSender(currentVolume,false);
     }
-
-    /**
-    if (lockControls) {
-        encoder.clearCount();
-        encoder.setCount(currentVolume*2);
-        return;
-    }
-    
-    currentEncoderValue = encoder.getCount();
-    // Only if initial run or value has changed. And only after "full step" of rotary encoder
-    if (((lastEncoderValue != currentEncoderValue) || lastVolume == -1) && (currentEncoderValue % 2 == 0)) {
-        lastTimeActiveTimestamp = millis();        // Set inactive back if rotary encoder was used
-        if (_maxVolume * 2 < currentEncoderValue) {
-            encoder.clearCount();
-            encoder.setCount(_maxVolume * 2);
-            loggerNl(serialDebug, (char *) FPSTR(maxLoudnessReached), LOGLEVEL_INFO);
-            currentEncoderValue = encoder.getCount();
-        } else if (currentEncoderValue < _minVolume) {
-            encoder.clearCount();
-            encoder.setCount(currentVolume*2);
-            return;
-        }
-
-        currentEncoderValue = encoder.getCount();
-        // Only if initial run or value has changed. And only after "full step" of rotary encoder
-        if (((lastEncoderValue != currentEncoderValue) || lastVolume == -1) && (currentEncoderValue % 2 == 0)) {
-            lastTimeActiveTimestamp = millis();        // Set inactive back if rotary encoder was used
-            if (_maxVolume * 2 < currentEncoderValue) {
-                encoder.clearCount();
-                encoder.setCount(_maxVolume * 2);
-                loggerNl(serialDebug, (char *) FPSTR(maxLoudnessReached), LOGLEVEL_INFO);
-                currentEncoderValue = encoder.getCount();
-            } else if (currentEncoderValue < _minVolume) {
-                encoder.clearCount();
-                encoder.setCount(_minVolume);
-                loggerNl(serialDebug, (char *) FPSTR(minLoudnessReached), LOGLEVEL_INFO);
-                currentEncoderValue = encoder.getCount();
-            }
-            lastEncoderValue = currentEncoderValue;
-            currentVolume = lastEncoderValue / 2;
-            if (currentVolume != lastVolume) {
-                lastVolume = currentVolume;
-                volumeToQueueSender(currentVolume, false);
-            }
-        }
-    } 
-    **/
 }
 
 
@@ -5196,7 +5137,7 @@ void loop() {
         #ifdef USEROTARY_ENABLE
             rotaryVolumeHandler(minVolume, maxVolume);
         #endif
-        #ifdef USERPOTENTIOMETER_ENABLE
+        #ifdef USEPOTENTIOMETER_ENABLE
             potentiometerVolumeHandler(minVolume, maxVolume);
         #endif
         if (wifiManager() == WL_CONNECTED) {

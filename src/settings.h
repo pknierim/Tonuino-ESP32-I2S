@@ -17,7 +17,7 @@
     99: custom                   => settings-custom.h
     more to come...
     */
-    #define HAL 1                // HAL 1 = LoLin32, 2 = ESP32-A1S-AudioKit, 3 = Lolin D32, 4 = Lolin D32 pro; 99 = custom
+    #define HAL 5                // HAL 1 = LoLin32, 2 = ESP32-A1S-AudioKit, 3 = Lolin D32, 4 = Lolin D32 pro; 99 = custom
 
 
     //########################## MODULES #################################
@@ -33,24 +33,24 @@
     //#define MEASURE_BATTERY_VOLTAGE         // Enables battery-measurement via GPIO (ADC) and voltage-divider
     //#define PLAY_LAST_RFID_AFTER_REBOOT   // When restarting ESPuino, the last RFID that was active before, is recalled and played
     //#define USE_LAST_VOLUME_AFTER_REBOOT  // Remembers the volume used at last shutdown after reboot
-    #define USERPOTENTIOMETER_ENABLE
+    #define USEPOTENTIOMETER_ENABLE
     //#define USEROTARY_ENABLE                // If rotary-encoder is used (don't forget to review WAKEUP_BUTTON if you disable this feature!)
     #define BLUETOOTH_ENABLE                // If enabled and bluetooth-mode is active, you can stream to your ESPuino via bluetooth (a2dp-sink).
     //#define IR_CONTROL_ENABLE             // Enables remote control
 
 
     //################## select SD card mode #############################
-    //#define SD_MMC_1BIT_MODE              // run SD card in SD-MMC 1Bit mode
+    #define SD_MMC_1BIT_MODE              // run SD card in SD-MMC 1Bit mode
     //#define SINGLE_SPI_ENABLE             // If only one SPI-instance should be used instead of two (not yet working!) (Works on ESP32-A1S with RFID via I2C)
 
 
     //################## select RFID reader ##############################
-    #define RFID_READER_TYPE_MFRC522_SPI    // use MFRC522 via SPI
+    //#define RFID_READER_TYPE_MFRC522_SPI    // use MFRC522 via SPI
     //#define RFID_READER_TYPE_MFRC522_I2C  // use MFRC522 via I2C
-    //#define RFID_READER_TYPE_PN5180       // use PN5180
+    #define RFID_READER_TYPE_PN5180       // use PN5180
 
     #ifdef RFID_READER_TYPE_PN5180
-        //#define PN5180_ENABLE_LPCD        // enable PN5180 low power card detection. Wakes up ESPuino if RFID-tag was applied while deepsleep is active.
+        #define PN5180_ENABLE_LPCD        // enable PN5180 low power card detection. Wakes up ESPuino if RFID-tag was applied while deepsleep is active.
     #endif
 
     #ifdef RFID_READER_TYPE_MFRC522_SPI
@@ -139,7 +139,7 @@
     uint16_t intervalToLongPress = 700;                 // Interval in ms to distinguish between short and long press of previous/next-button
 
     // RFID
-    #define RFID_SCAN_INTERVAL 30                      // Interval-time in ms (how often is RFID read?)
+    #define RFID_SCAN_INTERVAL 200                      // Interval-time in ms (how often is RFID read?)
 
     // Automatic restart
     #ifdef SHUTDOWN_IF_SD_BOOT_FAILS
